@@ -8,7 +8,10 @@ from openrouter_blended_price import (
     PERCENTILE_KEYS,
     base_model_id,
     blended_per_mtok,
+    hover_text,
     intelligence_index,
+    parse_percentile,
+    plot_path,
     plot_points,
     throughput_percentiles,
     to_float,
@@ -200,3 +203,79 @@ class TestPlotPoints:
 
 def test_percentile_keys_match_display_order():
     assert PERCENTILE_KEYS == (50, 75, 90, 95, 99)
+
+
+class TestParsePercentile:
+    def test_accepts_bare_number(self):
+        assert parse_percentile(50) == 50
+        assert parse_percentile("50") == 50
+
+    def test_accepts_p_prefixed(self):
+        assert parse_percentile("p50") == 50
+        assert parse_percentile("P99") == 99
+
+    def test_accepts_percent_sign(self):
+        assert parse_percentile("95%") == 95
+
+    def test_tolerates_surrounding_space(self):
+        assert parse_percentile(" p75 ") == 75
+
+    def test_rejects_unparseable(self):
+        assert parse_percentile("median") is None
+        assert parse_percentile(None) is None
+
+
+class TestHoverText:
+    def row(self, **overrides):
+        base = {
+            "id": "openai/gpt-6-astra",
+            "provider_name": "OpenAI",
+            "quantization": "fp8",
+            "intelligence_index": 48.0,
+            "context_length": 1050000,
+            "provider_blended_per_mtok": 1.5,
+            "model_blended_per_mtok": 3.0,
+            "delta_vs_model": -1.5,
+            "throughput_avg": 230.4,
+            "throughput_percentiles": {50: 210.0, 95: 280.0},
+            "uptime": 0.997,
+            "latency": 0.42,
+        }
+        return {**base, **overrides}
+
+    def test_always_identifies_model_and_provider(self):
+        text = hover_text(self.row())
+        assert "openai/gpt-6-astra" in text
+        assert "OpenAI" in text
+
+    def test_includes_prices_and_percentiles(self):
+        text = hover_text(self.row())
+        assert "$1.500/Mtok" in text
+        assert "$-1.500" in text
+        assert "210/280" in text
+
+    def test_omits_unknown_quantization(self):
+        assert "quantization" not in hover_text(self.row(quantization="unknown"))
+
+    def test_omits_absent_uptime_and_latency(self):
+        text = hover_text(self.row(uptime=None, latency=None))
+        assert "uptime" not in text
+        assert "latency" not in text
+
+    def test_omits_percentile_line_when_empty(self):
+        text = hover_text(self.row(throughput_percentiles={}))
+        assert "p50/75" not in text
+
+
+class TestPlotPath:
+    def test_appends_html_when_no_suffix(self):
+        assert plot_path("chart") == "chart.html"
+
+    def test_respects_explicit_suffix(self):
+        assert plot_path("chart.png") == "chart.png"
+
+    def test_dotted_name_is_not_treated_as_suffixless(self):
+        assert plot_path("plot.v2") == "plot.v2"
+
+    def test_handles_directory_prefix(self):
+        assert plot_path("out/chart") == "out/chart.html"

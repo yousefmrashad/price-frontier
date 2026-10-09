@@ -22,6 +22,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import requests
@@ -308,6 +309,41 @@ def plot_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def hover_text(row: dict[str, Any]) -> str:
+    """Tooltip body. This is how you tell the points apart, so it carries
+    every field the table would have shown plus the ones it doesn't."""
+    pcts = row["throughput_percentiles"]
+    lines = [
+        f"<b>{row['id']}</b>",
+        f"provider: {row['provider_name']}",
+    ]
+    if row.get("quantization") and row["quantization"] != "unknown":
+        lines.append(f"quantization: {row['quantization']}")
+    lines += [
+        f"intelligence: {row['intelligence_index']:.1f}",
+        f"context: {row['context_length']:,}",
+        f"blended: {money(row['provider_blended_per_mtok'])}/Mtok",
+        f"model blended: {money(row['model_blended_per_mtok'])}/Mtok",
+        f"delta: {money(row['delta_vs_model'])}",
+        f"throughput avg: {row['throughput_avg']:.0f} tok/s",
+    ]
+    if pcts:
+        lines.append(
+            "p50/75/90/95/99: "
+            + "/".join(f"{pcts[p]:.0f}" for p in PERCENTILE_KEYS if p in pcts)
+        )
+    if row.get("uptime") is not None:
+        lines.append(f"uptime 30m: {row['uptime'] * 100:.1f}%")
+    if row.get("latency") is not None:
+        lines.append(f"latency 30m: {row['latency']:.2f}s")
+    return "<br>".join(lines)
+
+
+def plot_path(raw: str) -> str:
+    """Default to .html so `--plot chart` still opens as an interactive page."""
+    return raw if Path(raw).suffix else f"{raw}.html"
+
+
 def write_plot(
     rows: list[dict[str, Any]],
     path: str,
@@ -315,6 +351,7 @@ def write_plot(
     output_ratio: float,
     cache_write_share: float,
 ) -> None:
+    path = plot_path(path)
     points = plot_points(rows)
     if not points:
         fail(
@@ -323,99 +360,66 @@ def write_plot(
             "($OPENROUTER_API_KEY); try a wider --include or a higher --limit."
         )
 
-    # Imported lazily so the table and JSON paths do not pay matplotlib's
-    # ~400ms import cost.
-    import matplotlib
+    # Imported lazily so the table and JSON paths do not pay for it.
+    import plotly.graph_objects as go
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    import seaborn as sns
-
-    frame = pd.DataFrame(
-        [
-            {
-                "model": r["id"],
-                "provider": r["provider_name"],
-                "blended_per_mtok": r["provider_blended_per_mtok"],
-                "throughput": r["throughput_avg"],
-                "intelligence_index": r["intelligence_index"],
-            }
-            for r in points
-        ]
-    )
-
-    sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(13, 8))
-    sns.scatterplot(
-        data=frame,
-        x="throughput",
-        y="blended_per_mtok",
-        hue="intelligence_index",
-        palette="viridis",
-        # Price is already the y axis, so encoding it as size again just
-        # duplicates the legend without adding information.
-        s=90,
-        alpha=0.85,
-        edgecolor="white",
-        linewidth=0.6,
-        ax=ax,
-    )
-    ax.set_yscale("log")
-    ax.set_xlabel("Throughput (tokens/sec, avg of reported percentiles)")
-    ax.set_ylabel("Blended $/Mtok (provider, log scale)")
-    ax.set_title(
-        "Cost vs throughput by model@provider\n"
-        f"color = intelligence index   |   "
-        f"cache_hit={cache_hit_rate:.0%}, output_ratio={output_ratio:.0%}, "
-        f"cache_write_share={cache_write_share:.0%}"
-    )
-
-    # Label the frontier points worth spotting: cheapest and fastest in the set.
-    # Iterating a DataFrame yields column names, so go through to_dict("records").
-    records = frame.to_dict("records")
-    highlights = [
-        ("cheapest", min(records, key=lambda d: d["blended_per_mtok"])),
-        ("fastest", max(records, key=lambda d: d["throughput"])),
-    ]
-    xs = frame["throughput"]
-    ys = frame["blended_per_mtok"]
-    for label, point in highlights:
-        # Flip the label inward when the point sits near an edge, otherwise the
-        # text box gets clipped by the axes boundary.
-        near_right = point["throughput"] > xs.quantile(0.8)
-        near_top = point["blended_per_mtok"] > ys.quantile(0.8)
-        offset = (-8 if near_right else 8, -8 if near_top else 8)
-        ax.annotate(
-            f"{label}: {point['model']}\n@ {point['provider']}",
-            xy=(point["throughput"], point["blended_per_mtok"]),
-            xytext=offset,
-            textcoords="offset points",
-            ha="right" if near_right else "left",
-            va="top" if near_top else "bottom",
-            fontsize=8,
-            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+    fig = go.Figure(
+        go.Scatter(
+            x=[r["throughput_avg"] for r in points],
+            y=[r["provider_blended_per_mtok"] for r in points],
+            text=[hover_text(r) for r in points],
+            hovertemplate="%{text}<extra></extra>",
+            mode="markers",
+            marker={
+                # Price is already the y axis; spending marker size on it again
+                # would duplicate the axis. Size by intelligence instead, which
+                # is otherwise only carried by color.
+                "size": [12 + r["intelligence_index"] / 4 for r in points],
+                "sizemode": "diameter",
+                "color": [r["intelligence_index"] for r in points],
+                "colorscale": "Viridis",
+                "colorbar": {"title": {"text": "intelligence<br>index"}},
+                "line": {"color": "white", "width": 0.8},
+                "opacity": 0.85,
+                "showscale": True,
+            },
+            name="model@provider",
         )
+    )
 
-    # Headroom so the labels and the colorbar both stay inside the canvas.
-    ax.margins(x=0.12, y=0.15)
-    sns.despine(ax=ax)
-    if ax.legend_ is not None:
-        ax.legend_.set_title("intelligence index")
-        ax.legend_.set_bbox_to_anchor((1.02, 1.0))
-        ax.legend_.loc = "upper left"
-
-    fig.tight_layout()
+    fig.update_layout(
+        title={
+            "text": (
+                "Cost vs throughput by model@provider"
+                f"<br><sup>color and size = intelligence index | "
+                f"cache_hit={cache_hit_rate:.0%}, output_ratio={output_ratio:.0%}, "
+                f"cache_write_share={cache_write_share:.0%}</sup>"
+            )
+        },
+        xaxis_title="Throughput (tokens/sec, avg of reported percentiles)",
+        yaxis_title="Blended $/Mtok (provider, log scale)",
+        yaxis_type="log",
+        template="plotly_white",
+        hovermode="closest",
+        # Hover anywhere in the column, not just on the marker itself, so the
+        # exact x/y can still be read in a crowded cluster.
+        hoverdistance=-1,
+        width=1100,
+        height=700,
+    )
     try:
-        fig.savefig(path, dpi=150)
-    except OSError as exc:
+        fig.write_html(path, include_plotlyjs="cdn")
+    except (OSError, ValueError) as exc:
         fail(f"could not write {path}: {exc}")
-    finally:
-        plt.close(fig)
+
     typer.secho(
-        f"wrote {path} ({len(frame)} of {len(rows)} provider rows had both "
+        f"wrote {path} ({len(points)} of {len(rows)} provider rows had both "
         f"throughput and an intelligence index)",
         fg=typer.colors.GREEN,
+    )
+    typer.echo(
+        "open it in a browser and hover a point for the model, provider, "
+        "and full price/throughput breakdown"
     )
 
 
@@ -601,8 +605,9 @@ def main(
         typer.Option(
             "--plot",
             metavar="PATH",
-            help="write a blended $/Mtok vs throughput scatter to PATH, colored "
-            "by intelligence index; throughput needs an API key",
+            help="write an interactive blended $/Mtok vs throughput scatter to "
+            "PATH (defaults to .html); hover a point for the model and provider. "
+            "Throughput needs an API key",
         ),
     ] = None,
 ) -> None:
