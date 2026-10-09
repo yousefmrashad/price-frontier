@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Annotated, Any
+from enum import Enum
+from typing import Annotated, Any, NoReturn
 
 import requests
 import typer
@@ -31,12 +33,57 @@ TOKENS = 1_000_000
 USER_AGENT = "openrouter-blended-price/1.0"
 
 
-def build_session(api_key: str | None) -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": USER_AGENT})
-    if api_key:
-        session.headers["Authorization"] = f"Bearer {api_key}"
-    return session
+class SortKey(str, Enum):
+    BLENDED = "blended"
+    INTELLIGENCE = "intelligence"
+    PROMPT = "prompt"
+    CONTEXT = "context"
+
+
+class TpsMode(str, Enum):
+    AVG = "avg"
+    PERCENTILES = "percentiles"
+
+
+class ProviderSort(str, Enum):
+    PROVIDER = "provider"
+    DELTA = "delta"
+    MODEL = "model"
+    NAME = "name"
+
+
+def fail(message: str) -> NoReturn:
+    """Exit with a clean one-line error.
+
+    typer.BadParameter is for argument validation and renders every failure as
+    "Invalid value for <flag>", which is wrong for a bad URL or a 5xx.
+    """
+    typer.secho(f"error: {message}", fg=typer.colors.RED, err=True)
+    raise typer.Exit(1)
+
+
+class SessionFactory:
+    """Hands out one requests.Session per thread.
+
+    Session keeps mutable connection-pool state and is not documented as
+    thread-safe, so the provider fan-out cannot share a single instance.
+    """
+
+    def __init__(self, api_key: str | None) -> None:
+        self._api_key = api_key
+        self._local = threading.local()
+
+    def get(self) -> requests.Session:
+        session: requests.Session | None = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(
+                {"Accept": "application/json", "User-Agent": USER_AGENT}
+            )
+            if self._api_key:
+                session.headers["Authorization"] = f"Bearer {self._api_key}"
+            self._local.session = session
+        return session
 
 
 def _get_json(session: requests.Session, url: str, timeout: float) -> dict[str, Any]:
@@ -52,12 +99,12 @@ def fetch_models(
         payload = _get_json(session, url, timeout)
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "?"
-        raise typer.BadParameter(f"HTTP {status} from {url}") from exc
+        fail(f"HTTP {status} from {url}")
     except requests.RequestException as exc:
-        raise typer.BadParameter(f"request failed: {exc}") from exc
+        fail(f"request to {url} failed: {exc}")
     data = payload.get("data")
     if not isinstance(data, list):
-        raise typer.BadParameter("unexpected response: missing 'data' array")
+        fail(f"unexpected response from {url}: missing 'data' array")
     return data
 
 
@@ -93,20 +140,32 @@ def to_float(value: Any) -> float | None:
 
 
 def intelligence_index(model: dict[str, Any]) -> float | None:
+    """Find an intelligence score anywhere in the model payload.
+
+    The key sits at a different depth depending on the OpenRouter response, so
+    walk the whole structure. Lists must be descended into explicitly: the AA
+    scores arrive nested under things like {"architectures": [...]}.
+    """
     stack: list[Any] = [model]
     seen: set[int] = set()
     while stack:
         node = stack.pop()
-        if not isinstance(node, dict) or id(node) in seen:
-            continue
-        seen.add(id(node))
-        for key, value in node.items():
-            lowered = key.lower().replace("-", "_")
-            if "intelligence" in lowered and "index" in lowered:
-                score = to_float(value)
-                if score is not None:
-                    return score
-        stack.extend(node.values())
+        if isinstance(node, dict):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            for key, value in node.items():
+                lowered = key.lower().replace("-", "_")
+                if "intelligence" in lowered and "index" in lowered:
+                    score = to_float(value)
+                    if score is not None:
+                        return score
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.extend(node)
     return None
 
 
@@ -115,7 +174,7 @@ def blended_per_mtok(
     cache_hit_rate: float,
     output_ratio: float,
     cache_write_share: float,
-) -> tuple[float | None, dict[str, float | None]]:
+) -> tuple[float | None, dict[str, Any]]:
     pricing = pricing or {}
     prompt = to_float(pricing.get("prompt"))
     completion = to_float(pricing.get("completion"))
@@ -125,7 +184,7 @@ def blended_per_mtok(
             "completion": None,
             "cache_read": None,
             "cache_write": None,
-            "cache_read_priced": 0.0,
+            "cache_read_priced": False,
         }
 
     cache_read = to_float(pricing.get("input_cache_read"))
@@ -154,11 +213,11 @@ def blended_per_mtok(
         "completion": completion * TOKENS,
         "cache_read": cache_read * TOKENS,
         "cache_write": cache_write * TOKENS,
-        "cache_read_priced": 1.0 if cache_read_priced else 0.0,
+        "cache_read_priced": cache_read_priced,
     }
 
 
-PERCENTILES = (("p50", 50), ("p75", 75), ("p90", 90), ("p95", 95), ("p99", 99))
+PERCENTILE_KEYS = (50, 75, 90, 95, 99)
 
 
 def throughput_percentiles(endpoint: dict[str, Any]) -> dict[int, float]:
@@ -182,32 +241,182 @@ def throughput_percentiles(endpoint: dict[str, Any]) -> dict[int, float]:
 
     out: dict[int, float] = {}
     if isinstance(raw, dict):
-        for name, pct in PERCENTILES:
-            for key in (name, f"p{pct}", str(pct)):
-                if key in raw:
-                    value = to_float(raw[key])
-                    if value is not None:
-                        out[pct] = value
-                        break
+        for pct in PERCENTILE_KEYS:
+            # Same value may be spelled "p50", "50", or "50%" depending on window.
+            for key in (f"p{pct}", str(pct), f"{pct}%"):
+                value = to_float(raw.get(key))
+                if value is not None:
+                    out[pct] = value
+                    break
     elif isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            label = item.get("percentile") or item.get("p") or item.get("quantile")
-            value = to_float(
-                item.get("value")
-                or item.get("tokens_per_second")
-                or item.get("tokens_per_sec")
-                or item.get("throughput")
+            pct = parse_percentile(
+                item.get("percentile", item.get("p", item.get("quantile")))
             )
-            pct = to_float(label)
+            value = first_float(
+                item, "value", "tokens_per_second", "tokens_per_sec", "throughput"
+            )
             if pct is not None and value is not None:
-                out[int(pct)] = value
+                out[pct] = value
     return out
+
+
+def parse_percentile(label: Any) -> int | None:
+    """Normalize a percentile label to its integer.
+
+    The dict branch keys off "p50", so the list branch accepts the same spelling
+    rather than only a bare number.
+    """
+    if label is None:
+        return None
+    text = str(label).strip().lower().removeprefix("p").removesuffix("%")
+    value = to_float(text)
+    return int(value) if value is not None else None
+
+
+def first_float(node: dict[str, Any], *keys: str) -> float | None:
+    """First key that parses as a number.
+
+    Uses explicit None checks rather than `or` chaining so a legitimate 0.0
+    reading is not skipped in favour of a later key.
+    """
+    for key in keys:
+        value = to_float(node.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def money(value: float | None) -> str:
     return "-" if value is None else f"${value:,.3f}"
+
+
+def plot_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rows that can actually be placed: needs both throughput and price.
+
+    Rows without an intelligence index are dropped rather than painted grey,
+    since the color channel is the whole point of the chart.
+    """
+    return [
+        r
+        for r in rows
+        if r["throughput_avg"] is not None
+        and r["intelligence_index"] is not None
+        and r["provider_blended_per_mtok"] is not None
+    ]
+
+
+def write_plot(
+    rows: list[dict[str, Any]],
+    path: str,
+    cache_hit_rate: float,
+    output_ratio: float,
+    cache_write_share: float,
+) -> None:
+    points = plot_points(rows)
+    if not points:
+        fail(
+            "no provider row has both throughput and an intelligence index, "
+            "so there is nothing to plot. Throughput needs an API key "
+            "($OPENROUTER_API_KEY); try a wider --include or a higher --limit."
+        )
+
+    # Imported lazily so the table and JSON paths do not pay matplotlib's
+    # ~400ms import cost.
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import seaborn as sns
+
+    frame = pd.DataFrame(
+        [
+            {
+                "model": r["id"],
+                "provider": r["provider_name"],
+                "blended_per_mtok": r["provider_blended_per_mtok"],
+                "throughput": r["throughput_avg"],
+                "intelligence_index": r["intelligence_index"],
+            }
+            for r in points
+        ]
+    )
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(13, 8))
+    sns.scatterplot(
+        data=frame,
+        x="throughput",
+        y="blended_per_mtok",
+        hue="intelligence_index",
+        palette="viridis",
+        # Price is already the y axis, so encoding it as size again just
+        # duplicates the legend without adding information.
+        s=90,
+        alpha=0.85,
+        edgecolor="white",
+        linewidth=0.6,
+        ax=ax,
+    )
+    ax.set_yscale("log")
+    ax.set_xlabel("Throughput (tokens/sec, avg of reported percentiles)")
+    ax.set_ylabel("Blended $/Mtok (provider, log scale)")
+    ax.set_title(
+        "Cost vs throughput by model@provider\n"
+        f"color = intelligence index   |   "
+        f"cache_hit={cache_hit_rate:.0%}, output_ratio={output_ratio:.0%}, "
+        f"cache_write_share={cache_write_share:.0%}"
+    )
+
+    # Label the frontier points worth spotting: cheapest and fastest in the set.
+    # Iterating a DataFrame yields column names, so go through to_dict("records").
+    records = frame.to_dict("records")
+    highlights = [
+        ("cheapest", min(records, key=lambda d: d["blended_per_mtok"])),
+        ("fastest", max(records, key=lambda d: d["throughput"])),
+    ]
+    xs = frame["throughput"]
+    ys = frame["blended_per_mtok"]
+    for label, point in highlights:
+        # Flip the label inward when the point sits near an edge, otherwise the
+        # text box gets clipped by the axes boundary.
+        near_right = point["throughput"] > xs.quantile(0.8)
+        near_top = point["blended_per_mtok"] > ys.quantile(0.8)
+        offset = (-8 if near_right else 8, -8 if near_top else 8)
+        ax.annotate(
+            f"{label}: {point['model']}\n@ {point['provider']}",
+            xy=(point["throughput"], point["blended_per_mtok"]),
+            xytext=offset,
+            textcoords="offset points",
+            ha="right" if near_right else "left",
+            va="top" if near_top else "bottom",
+            fontsize=8,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+        )
+
+    # Headroom so the labels and the colorbar both stay inside the canvas.
+    ax.margins(x=0.12, y=0.15)
+    sns.despine(ax=ax)
+    if ax.legend_ is not None:
+        ax.legend_.set_title("intelligence index")
+        ax.legend_.set_bbox_to_anchor((1.02, 1.0))
+        ax.legend_.loc = "upper left"
+
+    fig.tight_layout()
+    try:
+        fig.savefig(path, dpi=150)
+    except OSError as exc:
+        fail(f"could not write {path}: {exc}")
+    finally:
+        plt.close(fig)
+    typer.secho(
+        f"wrote {path} ({len(frame)} of {len(rows)} provider rows had both "
+        f"throughput and an intelligence index)",
+        fg=typer.colors.GREEN,
+    )
 
 
 @dataclass
@@ -218,14 +427,17 @@ class Settings:
     output_ratio: float
     cache_write_share: float
     provider_workers: int
-    session: requests.Session
+    sessions: SessionFactory
 
 
 def build_provider_rows(
     models: list[dict[str, Any]], cfg: Settings
 ) -> list[dict[str, Any]]:
     def load(row: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        endpoints = fetch_endpoints(cfg.session, row["id"], cfg.api_base, cfg.timeout)
+        # Called on a pool worker thread, so this resolves that thread's own session.
+        endpoints = fetch_endpoints(
+            cfg.sessions.get(), row["id"], cfg.api_base, cfg.timeout
+        )
         return row, endpoints
 
     rows: list[dict[str, Any]] = []
@@ -267,9 +479,7 @@ def build_provider_rows(
                         "provider_completion_per_mtok": pprices["completion"],
                         "provider_cache_read_per_mtok": pprices["cache_read"],
                         "provider_cache_write_per_mtok": pprices["cache_write"],
-                        "provider_cache_read_priced": bool(
-                            pprices["cache_read_priced"]
-                        ),
+                        "provider_cache_read_priced": pprices["cache_read_priced"],
                         "uptime": to_float(ep.get("uptime_last_30m")),
                         "latency": to_float(ep.get("latency_last_30m")),
                         "throughput_percentiles": pcts,
@@ -331,11 +541,10 @@ def main(
         typer.Option("--exclude", help="regex to drop, applied after --include"),
     ] = None,
     limit: Annotated[
-        int, typer.Option("--limit", help="max models to expand (default 10)")
+        int,
+        typer.Option("--limit", min=0, help="max models to expand (default 10)"),
     ] = 10,
-    sort: Annotated[
-        str, typer.Option("--sort", help="blended | intelligence | prompt | context")
-    ] = "blended",
+    sort: Annotated[SortKey, typer.Option("--sort")] = SortKey.BLENDED,
     descending: Annotated[
         bool, typer.Option("--descending", help="reverse the sort order")
     ] = False,
@@ -353,24 +562,21 @@ def main(
     provider_limit: Annotated[
         int,
         typer.Option(
-            "--provider-limit", help="max provider rows per model (0 = no cap)"
+            "--provider-limit", min=0, help="max provider rows per model (0 = no cap)"
         ),
     ] = 0,
     provider_workers: Annotated[
         int,
         typer.Option(
-            "--provider-workers", help="parallel endpoints requests (default 6)"
+            "--provider-workers",
+            min=1,
+            help="parallel endpoints requests (default 6)",
         ),
     ] = 6,
-    tps: Annotated[
-        str,
-        typer.Option(
-            "--tps", help="throughput column: avg | percentiles (default avg)"
-        ),
-    ] = "avg",
-    provider_sort: Annotated[
-        str, typer.Option("--provider-sort", help="provider | delta | model | name")
-    ] = "provider",
+    tps: Annotated[TpsMode, typer.Option("--tps")] = TpsMode.AVG,
+    provider_sort: Annotated[ProviderSort, typer.Option("--provider-sort")] = (
+        ProviderSort.PROVIDER
+    ),
     api_key: Annotated[
         str | None,
         typer.Option(
@@ -386,10 +592,19 @@ def main(
     url: Annotated[
         str, typer.Option("--url", help="override the models endpoint")
     ] = MODELS_URL,
-    timeout: Annotated[float, typer.Option("--timeout")] = 30.0,
+    timeout: Annotated[float, typer.Option("--timeout", min=0.1)] = 30.0,
     as_json: Annotated[
         bool, typer.Option("--json", help="emit JSON instead of a table")
     ] = False,
+    plot: Annotated[
+        str | None,
+        typer.Option(
+            "--plot",
+            metavar="PATH",
+            help="write a blended $/Mtok vs throughput scatter to PATH, colored "
+            "by intelligence index; throughput needs an API key",
+        ),
+    ] = None,
 ) -> None:
     if cache_hit_rate < 0 or cache_hit_rate > 1:
         raise typer.BadParameter(
@@ -397,22 +612,12 @@ def main(
         )
     if output_ratio < 0:
         raise typer.BadParameter("must be >= 0", param_hint="--output-ratio")
-    if sort not in ("blended", "intelligence", "prompt", "context"):
-        raise typer.BadParameter(
-            "must be one of: blended, intelligence, prompt, context",
-            param_hint="--sort",
-        )
-    if tps not in ("avg", "percentiles"):
-        raise typer.BadParameter("must be one of: avg, percentiles", param_hint="--tps")
-    if provider_sort not in ("provider", "delta", "model", "name"):
-        raise typer.BadParameter(
-            "must be one of: provider, delta, model, name", param_hint="--provider-sort"
-        )
 
     include_re = re.compile(include, re.IGNORECASE) if include else None
     exclude_re = re.compile(exclude, re.IGNORECASE) if exclude else None
 
-    session = build_session(api_key)
+    sessions = SessionFactory(api_key)
+    session = sessions.get()
 
     rows: list[dict[str, Any]] = []
     for model in fetch_models(session, url, timeout):
@@ -453,16 +658,16 @@ def main(
                 "completion_per_mtok": prices["completion"],
                 "cache_read_per_mtok": prices["cache_read"],
                 "cache_write_per_mtok": prices["cache_write"],
-                "cache_read_priced": bool(prices["cache_read_priced"]),
+                "cache_read_priced": prices["cache_read_priced"],
                 "pricing": model.get("pricing") or {},
             }
         )
 
     key = {
-        "blended": lambda r: r["blended_per_mtok"],
-        "intelligence": lambda r: -(r["intelligence_index"] or 0.0),
-        "prompt": lambda r: r["prompt_per_mtok"] or 0.0,
-        "context": lambda r: r["context_length"],
+        SortKey.BLENDED: lambda r: r["blended_per_mtok"],
+        SortKey.INTELLIGENCE: lambda r: -(r["intelligence_index"] or 0.0),
+        SortKey.PROMPT: lambda r: r["prompt_per_mtok"] or 0.0,
+        SortKey.CONTEXT: lambda r: r["context_length"],
     }[sort]
     rows.sort(key=key, reverse=not descending)
     models_shown = rows[:limit]
@@ -478,14 +683,14 @@ def main(
                 output_ratio=output_ratio,
                 cache_write_share=cache_write_share,
                 provider_workers=provider_workers,
-                session=session,
+                sessions=sessions,
             ),
         )
         pkey = {
-            "provider": lambda r: r["provider_blended_per_mtok"],
-            "delta": lambda r: r["delta_vs_model"],
-            "model": lambda r: r["model_blended_per_mtok"],
-            "name": lambda r: r["provider_name"],
+            ProviderSort.PROVIDER: lambda r: r["provider_blended_per_mtok"],
+            ProviderSort.DELTA: lambda r: r["delta_vs_model"],
+            ProviderSort.MODEL: lambda r: r["model_blended_per_mtok"],
+            ProviderSort.NAME: lambda r: r["provider_name"],
         }[provider_sort]
         provider_rows.sort(key=pkey)
         if provider_limit > 0:
@@ -506,6 +711,9 @@ def main(
         "min_intelligence": min_intelligence,
         "limit": limit,
     }
+
+    if plot:
+        write_plot(provider_rows, plot, cache_hit_rate, output_ratio, cache_write_share)
 
     if as_json:
         print(
@@ -556,8 +764,8 @@ def main(
             f"\njoined on provider name - {len(provider_rows)} rows across "
             f"{len({r['id'] for r in provider_rows})} models"
         )
-        tps_col = "TPS_AVG" if tps == "avg" else "TPS 50/75/90/95/99"
-        tps_width = 8 if tps == "avg" else 17
+        tps_col = "TPS_AVG" if tps is TpsMode.AVG else "TPS 50/75/90/95/99"
+        tps_width = 8 if tps is TpsMode.AVG else 17
         pheader = (
             f"{'PROVIDER':<22} {'MODEL':<46} {'QUANT':<10} {tps_col:>{tps_width}} "
             f"{'MODEL_B':>11} {'PROV_B':>11} {'DELTA':>11} {'P_PROMPT':>10} "
@@ -572,13 +780,13 @@ def main(
                 if r["intelligence_index"] is None
                 else format(r["intelligence_index"], ".1f")
             )
-            if tps == "avg":
+            if tps is TpsMode.AVG:
                 avg = r["throughput_avg"]
                 tps_val = "-" if avg is None else f"{avg:.0f}"
             else:
                 pcts = r["throughput_percentiles"]
                 tps_val = (
-                    "/".join(f"{pcts[p]:.0f}" for _, p in PERCENTILES if p in pcts)
+                    "/".join(f"{pcts[p]:.0f}" for p in PERCENTILE_KEYS if p in pcts)
                     if pcts
                     else "-"
                 )
