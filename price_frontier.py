@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch OpenRouter model metadata and compute blended $/Mtok pricing.
+"""Cache-aware blended $/Mtok pricing for OpenRouter models and providers.
+
+Headline pricing per model is misleading: a cache hit costs a fraction of a
+fresh token, and the same model is often cheaper or faster at one provider than
+another. This computes one comparable number that accounts for both, at the
+model level and per provider.
 
 Blended cost model (defaults):
   - 1,000,000 input tokens per unit of work
@@ -8,9 +13,10 @@ Blended cost model (defaults):
     routes a portion of them at input_cache_write
   - output tokens = --output-ratio (0.01) * input tokens, priced at completion
 
-The top --limit models are then expanded per provider via /models/{id}/endpoints
-and joined on provider name, so each model/provider row carries both the
-model-level and provider-level blended price.
+The top --limit models are expanded per provider via /models/{id}/endpoints and
+joined on provider name, so each model/provider row carries both the model-level
+and provider-level blended price. Output is a table, JSON, or an interactive
+--plot of cost against throughput.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import typer
 API_BASE = "https://openrouter.ai/api/v1"
 MODELS_URL = f"{API_BASE}/models"
 TOKENS = 1_000_000
-USER_AGENT = "openrouter-blended-price/1.0"
+USER_AGENT = "price-frontier/0.1.0"
 
 
 class SortKey(str, Enum):

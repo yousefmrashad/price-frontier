@@ -1,7 +1,7 @@
 [project]
-name = "openpricer"
+name = "price-frontier"
 version = "0.1.0"
-description = "OpenRouter blended $/Mtok pricing with a per-provider join and cost/throughput scatter"
+description = "Cache-aware blended $/Mtok pricing for OpenRouter models and providers"
 requires-python = ">=3.13"
 dependencies = [
     "typer>=0.12",
@@ -13,10 +13,10 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
-openrouter-blended-price = "openrouter_blended_price:app"
+price-frontier = "price_frontier:app"
 
 [tool.ruff]
 line-length = 88
 
 [tool.pytest.ini_options]
-testpaths = ["test_openrouter_blended_price.py"]
+testpaths = ["test_price_frontier.py"]

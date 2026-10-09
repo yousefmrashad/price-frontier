@@ -4,7 +4,7 @@ from typing import ClassVar
 
 import pytest
 
-from openrouter_blended_price import (
+from price_frontier import (
     PERCENTILE_KEYS,
     base_model_id,
     blended_per_mtok,
