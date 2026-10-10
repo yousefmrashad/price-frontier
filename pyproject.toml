@@ -19,4 +19,4 @@ price-frontier = "price_frontier:app"
 line-length = 88
 
 [tool.pytest.ini_options]
-testpaths = ["test_price_frontier.py"]
+testpaths = ["./tests"]
