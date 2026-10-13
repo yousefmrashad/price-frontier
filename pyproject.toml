@@ -18,5 +18,9 @@ price-frontier = "price_frontier:app"
 [tool.ruff]
 line-length = 88
 
+[tool.basedpyright]
+typeCheckingMode = "standard"
+
 [tool.pytest.ini_options]
 testpaths = ["./tests"]
+pythonpath = ["."]

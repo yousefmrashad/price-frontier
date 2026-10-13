@@ -1,6 +1,6 @@
 """Tests for the pure functions. No network, no CLI."""
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -71,7 +71,7 @@ class TestIntelligenceIndex:
         assert intelligence_index({"intelligence_index": "n/a"}) is None
 
     def test_cycle_does_not_hang(self):
-        node: dict = {"intelligence_index": 3.0}
+        node: dict[str, Any] = {"intelligence_index": 3.0}
         node["self"] = node
         assert intelligence_index(node) == 3.0
 
@@ -81,7 +81,10 @@ class TestIntelligenceIndex:
 
 
 class TestBlendedPerMtok:
-    pricing: ClassVar = {"prompt": "0.000003", "completion": "0.000015"}
+    pricing: ClassVar[dict[str, str]] = {
+        "prompt": "0.000003",
+        "completion": "0.000015",
+    }
 
     def test_missing_pricing_is_none(self):
         blended, prices = blended_per_mtok(None, 0.85, 0.01, 0.0)
@@ -188,8 +191,8 @@ class TestThroughputPercentiles:
 
 
 class TestPlotPoints:
-    def row(self, **overrides):
-        base = {
+    def row(self, **overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
             "throughput_avg": 100.0,
             "intelligence_index": 40.0,
             "provider_blended_per_mtok": 5.0,
@@ -235,8 +238,8 @@ class TestParsePercentile:
 
 
 class TestHoverText:
-    def row(self, **overrides):
-        base = {
+    def row(self, **overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
             "id": "openai/gpt-6-astra",
             "provider_name": "OpenAI",
             "quantization": "fp8",
@@ -329,28 +332,28 @@ class TestEndpointLabel:
         assert endpoint_label(None, "openai/flex") == "unknown/flex"
 
 
-class FakeSession:
-    def __init__(self, payload=None, exc=None):
-        self._payload = payload
-        self._exc = exc
-        self.urls = []
+class FakeResponse:
+    def __init__(self, payload: Any) -> None:
+        self._payload: Any = payload
 
-    def get(self, url, timeout=None):
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> Any:
+        return self._payload
+
+
+class FakeSession:
+    def __init__(self, payload: Any = None, exc: Exception | None = None) -> None:
+        self._payload: Any = payload
+        self._exc: Exception | None = exc
+        self.urls: list[str] = []
+
+    def get(self, url: str, **_kwargs: Any) -> FakeResponse:
         self.urls.append(url)
         if self._exc is not None:
             raise self._exc
         return FakeResponse(self._payload)
-
-
-class FakeResponse:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self._payload
 
 
 class TestFetchZdrKeys:
@@ -400,7 +403,7 @@ class TestRetentionLabels:
         assert retention_mark(None) == "?"
 
     def test_hover_shows_retention(self):
-        base = {
+        base: dict[str, Any] = {
             "id": "m",
             "provider_name": "P",
             "intelligence_index": 40.0,
@@ -416,7 +419,7 @@ class TestRetentionLabels:
 
 
 class TestBuildProviderRowsZdr:
-    def _model(self):
+    def _model(self) -> dict[str, Any]:
         return {
             "id": "openai/gpt-5-mini",
             "intelligence_index": 50.0,
@@ -424,8 +427,8 @@ class TestBuildProviderRowsZdr:
             "blended_per_mtok": 1.0,
         }
 
-    def _endpoint(self, **overrides):
-        base = {
+    def _endpoint(self, **overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
             "provider_name": "OpenAI",
             "tag": "openai",
             "model_id": "openai/gpt-5-mini",
@@ -433,10 +436,18 @@ class TestBuildProviderRowsZdr:
         }
         return {**base, **overrides}
 
-    def _cfg(self, monkeypatch, endpoint, zdr_keys):
+    def _cfg(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        endpoint: dict[str, Any],
+        zdr_keys: set[tuple[str, str, str]] | None,
+    ) -> Settings:
         import price_frontier as pf
 
-        monkeypatch.setattr(pf, "fetch_endpoints", lambda *a, **k: [endpoint])
+        def fake_fetch(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return [endpoint]
+
+        monkeypatch.setattr(pf, "fetch_endpoints", fake_fetch)
         return Settings(
             api_base="https://x.test",
             timeout=5.0,
@@ -448,7 +459,7 @@ class TestBuildProviderRowsZdr:
             zdr_keys=zdr_keys,
         )
 
-    def test_marks_zdr_true_when_listed(self, monkeypatch):
+    def test_marks_zdr_true_when_listed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rows = build_provider_rows(
             [self._model()],
             self._cfg(
@@ -459,19 +470,23 @@ class TestBuildProviderRowsZdr:
         )
         assert rows[0]["zdr"] is True
 
-    def test_marks_zdr_false_when_absent(self, monkeypatch):
+    def test_marks_zdr_false_when_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rows = build_provider_rows(
             [self._model()], self._cfg(monkeypatch, self._endpoint(), set())
         )
         assert rows[0]["zdr"] is False
 
-    def test_marks_zdr_none_when_list_unreachable(self, monkeypatch):
+    def test_marks_zdr_none_when_list_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         rows = build_provider_rows(
             [self._model()], self._cfg(monkeypatch, self._endpoint(), None)
         )
         assert rows[0]["zdr"] is None
 
-    def test_endpoint_label_and_tag_stored(self, monkeypatch):
+    def test_endpoint_label_and_tag_stored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         rows = build_provider_rows(
             [self._model()],
             self._cfg(
@@ -483,8 +498,26 @@ class TestBuildProviderRowsZdr:
         assert rows[0]["endpoint"] == "OpenAI/flex"
         assert rows[0]["provider_tag"] == "openai/flex"
 
-    def test_hover_shows_endpoint_label(self):
-        base = {
+    def test_uptime_percent_scale_normalized_to_fraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = build_provider_rows(
+            [self._model()],
+            self._cfg(monkeypatch, self._endpoint(uptime_last_30m=100), set()),
+        )
+        assert rows[0]["uptime"] == pytest.approx(1.0)
+
+    def test_uptime_fraction_scale_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = build_provider_rows(
+            [self._model()],
+            self._cfg(monkeypatch, self._endpoint(uptime_last_30m=0.997), set()),
+        )
+        assert rows[0]["uptime"] == pytest.approx(0.997)
+
+    def test_hover_shows_endpoint_label(self) -> None:
+        base: dict[str, Any] = {
             "id": "m",
             "provider_name": "OpenAI",
             "endpoint": "OpenAI/flex",
@@ -498,8 +531,24 @@ class TestBuildProviderRowsZdr:
         }
         assert "endpoint: OpenAI/flex" in hover_text({**base, "zdr": None})
 
-    def test_hover_falls_back_to_provider_without_endpoint(self):
-        base = {
+    def test_hover_renders_full_uptime_as_100_percent(self) -> None:
+        base: dict[str, Any] = {
+            "id": "m",
+            "provider_name": "P",
+            "intelligence_index": 40.0,
+            "context_length": 1000,
+            "provider_blended_per_mtok": 1.0,
+            "model_blended_per_mtok": 2.0,
+            "delta_vs_model": -1.0,
+            "throughput_avg": 10.0,
+            "throughput_percentiles": {},
+            "uptime": 1.0,
+            "latency": None,
+        }
+        assert "uptime 30m: 100.0%" in hover_text(base)
+
+    def test_hover_falls_back_to_provider_without_endpoint(self) -> None:
+        base: dict[str, Any] = {
             "id": "m",
             "provider_name": "P",
             "intelligence_index": 40.0,

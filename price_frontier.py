@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, NoReturn, Protocol
 
 import requests
 import typer
@@ -75,6 +75,19 @@ def fail(message: str) -> NoReturn:
     raise typer.Exit(1)
 
 
+class JsonResponse(Protocol):
+    """Anything with raise_for_status/json, e.g. requests.Response or a fake."""
+
+    def raise_for_status(self) -> None: ...
+    def json(self) -> Any: ...
+
+
+class SessionLike(Protocol):
+    """Anything with requests.Session.get's shape, so tests can pass a fake."""
+
+    def get(self, url: str, **kwargs: Any) -> JsonResponse: ...
+
+
 class SessionFactory:
     """Hands out one requests.Session per thread.
 
@@ -99,14 +112,14 @@ class SessionFactory:
         return session
 
 
-def _get_json(session: requests.Session, url: str, timeout: float) -> dict[str, Any]:
+def _get_json(session: SessionLike, url: str, timeout: float) -> dict[str, Any]:
     resp = session.get(url, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
 
 def fetch_models(
-    session: requests.Session, url: str = MODELS_URL, timeout: float = 30.0
+    session: SessionLike, url: str = MODELS_URL, timeout: float = 30.0
 ) -> list[dict[str, Any]]:
     try:
         payload = _get_json(session, url, timeout)
@@ -147,7 +160,7 @@ def endpoint_label(provider_name: Any, tag: Any) -> str:
 
 
 def fetch_endpoints(
-    session: requests.Session,
+    session: SessionLike,
     model_id: str,
     base: str = API_BASE,
     timeout: float = 30.0,
@@ -179,7 +192,7 @@ def zdr_key(model_id: str, provider_name: Any, tag: Any) -> tuple[str, str, str]
 
 
 def fetch_zdr_keys(
-    session: requests.Session,
+    session: SessionLike,
     base: str = API_BASE,
     timeout: float = 30.0,
 ) -> set[tuple[str, str, str]] | None:
@@ -560,6 +573,13 @@ def build_provider_rows(
                 pcts = throughput_percentiles(ep)
                 quantization = ep.get("quantization")
                 ctx = to_float(ep.get("context_length")) or row["context_length"]
+                uptime_raw = to_float(ep.get("uptime_last_30m"))
+                # The API reports uptime as a 0-100 percentage (e.g. 100 for
+                # full uptime); store a 0-1 fraction so hover renders 100.0%.
+                if uptime_raw is not None and uptime_raw > 1:
+                    uptime: float | None = uptime_raw / 100.0
+                else:
+                    uptime = uptime_raw
                 if cfg.zdr_keys is None:
                     zdr: bool | None = None
                 else:
@@ -592,7 +612,7 @@ def build_provider_rows(
                         "provider_cache_read_per_mtok": pprices["cache_read"],
                         "provider_cache_write_per_mtok": pprices["cache_write"],
                         "provider_cache_read_priced": pprices["cache_read_priced"],
-                        "uptime": to_float(ep.get("uptime_last_30m")),
+                        "uptime": uptime,
                         "latency": to_float(ep.get("latency_last_30m")),
                         "throughput_percentiles": pcts,
                         "throughput_avg": (sum(pcts.values()) / len(pcts))
