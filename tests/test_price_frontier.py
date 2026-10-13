@@ -6,15 +6,24 @@ import pytest
 
 from price_frontier import (
     PERCENTILE_KEYS,
+    Retention,
+    SessionFactory,
+    Settings,
     base_model_id,
     blended_per_mtok,
+    build_provider_rows,
+    endpoint_label,
+    fetch_zdr_keys,
     hover_text,
     intelligence_index,
     parse_percentile,
     plot_path,
     plot_points,
+    retention_label,
+    retention_mark,
     throughput_percentiles,
     to_float,
+    zdr_key,
 )
 
 
@@ -279,3 +288,229 @@ class TestPlotPath:
 
     def test_handles_directory_prefix(self):
         assert plot_path("out/chart") == "out/chart.html"
+
+
+class TestZdrKey:
+    def test_strips_variant_suffix(self):
+        assert zdr_key("openai/gpt-5-mini:free", "OpenAI", "openai") == (
+            "openai/gpt-5-mini",
+            "OpenAI",
+            "openai",
+        )
+
+    def test_missing_tag_normalizes_to_empty(self):
+        assert zdr_key("m", "P", None)[2] == ""
+        assert zdr_key("m", "P", "")[2] == ""
+
+    def test_missing_provider_normalizes_to_unknown(self):
+        assert zdr_key("m", None, "t")[1] == "unknown"
+
+
+class TestEndpointLabel:
+    def test_qualified_tag_keeps_provider_and_qualifier(self):
+        assert endpoint_label("OpenAI", "openai/flex") == "OpenAI/flex"
+        assert endpoint_label("BaseTen", "baseten/fp4") == "BaseTen/fp4"
+
+    def test_nested_tag_uses_last_segment(self):
+        assert endpoint_label("Azure", "azure/swedencentral") == "Azure/swedencentral"
+
+    def test_bare_tag_matching_provider_collapses(self):
+        assert endpoint_label("Azure", "azure") == "Azure"
+        assert endpoint_label("OpenAI", "openai") == "OpenAI"
+
+    def test_bare_tag_not_matching_provider_is_kept(self):
+        assert endpoint_label("Foo", "fast") == "Foo/fast"
+
+    def test_missing_tag_is_provider_only(self):
+        assert endpoint_label("Phala", None) == "Phala"
+        assert endpoint_label("Phala", "") == "Phala"
+
+    def test_missing_provider_is_unknown(self):
+        assert endpoint_label(None, "openai/flex") == "unknown/flex"
+
+
+class FakeSession:
+    def __init__(self, payload=None, exc=None):
+        self._payload = payload
+        self._exc = exc
+        self.urls = []
+
+    def get(self, url, timeout=None):
+        self.urls.append(url)
+        if self._exc is not None:
+            raise self._exc
+        return FakeResponse(self._payload)
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class TestFetchZdrKeys:
+    def test_builds_triple_set(self):
+        session = FakeSession(
+            {
+                "data": [
+                    {
+                        "model_id": "openai/gpt-5-mini",
+                        "provider_name": "OpenAI",
+                        "tag": "openai",
+                    }
+                ]
+            }
+        )
+        assert fetch_zdr_keys(session, "https://x.test", 5.0) == {
+            ("openai/gpt-5-mini", "OpenAI", "openai")
+        }
+        assert session.urls == ["https://x.test/endpoints/zdr"]
+
+    def test_skips_non_dict_entries(self):
+        session = FakeSession(
+            {"data": ["junk", 7, {"model_id": "m", "provider_name": "P"}]}
+        )
+        assert fetch_zdr_keys(session) == {("m", "P", "")}
+
+    def test_failure_returns_none(self):
+        import requests
+
+        session = FakeSession(exc=requests.RequestException("down"))
+        assert fetch_zdr_keys(session) is None
+
+    def test_missing_data_returns_none(self):
+        assert fetch_zdr_keys(FakeSession({})) is None
+        assert fetch_zdr_keys(FakeSession({"data": {}})) is None
+
+
+class TestRetentionLabels:
+    def test_label(self):
+        assert retention_label(True) == "zero-retention"
+        assert retention_label(False) == "retains"
+        assert retention_label(None) == "unknown"
+
+    def test_mark(self):
+        assert retention_mark(True) == "yes"
+        assert retention_mark(False) == "no"
+        assert retention_mark(None) == "?"
+
+    def test_hover_shows_retention(self):
+        base = {
+            "id": "m",
+            "provider_name": "P",
+            "intelligence_index": 40.0,
+            "context_length": 1000,
+            "provider_blended_per_mtok": 1.0,
+            "model_blended_per_mtok": 2.0,
+            "delta_vs_model": -1.0,
+            "throughput_avg": 10.0,
+            "throughput_percentiles": {},
+        }
+        assert "zero-retention" in hover_text({**base, "zdr": True})
+        assert "retains" in hover_text({**base, "zdr": False})
+
+
+class TestBuildProviderRowsZdr:
+    def _model(self):
+        return {
+            "id": "openai/gpt-5-mini",
+            "intelligence_index": 50.0,
+            "context_length": 1000,
+            "blended_per_mtok": 1.0,
+        }
+
+    def _endpoint(self, **overrides):
+        base = {
+            "provider_name": "OpenAI",
+            "tag": "openai",
+            "model_id": "openai/gpt-5-mini",
+            "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+        }
+        return {**base, **overrides}
+
+    def _cfg(self, monkeypatch, endpoint, zdr_keys):
+        import price_frontier as pf
+
+        monkeypatch.setattr(pf, "fetch_endpoints", lambda *a, **k: [endpoint])
+        return Settings(
+            api_base="https://x.test",
+            timeout=5.0,
+            cache_hit_rate=0.0,
+            output_ratio=0.0,
+            cache_write_share=0.0,
+            provider_workers=1,
+            sessions=SessionFactory(None),
+            zdr_keys=zdr_keys,
+        )
+
+    def test_marks_zdr_true_when_listed(self, monkeypatch):
+        rows = build_provider_rows(
+            [self._model()],
+            self._cfg(
+                monkeypatch,
+                self._endpoint(),
+                {("openai/gpt-5-mini", "OpenAI", "openai")},
+            ),
+        )
+        assert rows[0]["zdr"] is True
+
+    def test_marks_zdr_false_when_absent(self, monkeypatch):
+        rows = build_provider_rows(
+            [self._model()], self._cfg(monkeypatch, self._endpoint(), set())
+        )
+        assert rows[0]["zdr"] is False
+
+    def test_marks_zdr_none_when_list_unreachable(self, monkeypatch):
+        rows = build_provider_rows(
+            [self._model()], self._cfg(monkeypatch, self._endpoint(), None)
+        )
+        assert rows[0]["zdr"] is None
+
+    def test_endpoint_label_and_tag_stored(self, monkeypatch):
+        rows = build_provider_rows(
+            [self._model()],
+            self._cfg(
+                monkeypatch,
+                self._endpoint(provider_name="OpenAI", tag="openai/flex"),
+                set(),
+            ),
+        )
+        assert rows[0]["endpoint"] == "OpenAI/flex"
+        assert rows[0]["provider_tag"] == "openai/flex"
+
+    def test_hover_shows_endpoint_label(self):
+        base = {
+            "id": "m",
+            "provider_name": "OpenAI",
+            "endpoint": "OpenAI/flex",
+            "intelligence_index": 40.0,
+            "context_length": 1000,
+            "provider_blended_per_mtok": 1.0,
+            "model_blended_per_mtok": 2.0,
+            "delta_vs_model": -1.0,
+            "throughput_avg": 10.0,
+            "throughput_percentiles": {},
+        }
+        assert "endpoint: OpenAI/flex" in hover_text({**base, "zdr": None})
+
+    def test_hover_falls_back_to_provider_without_endpoint(self):
+        base = {
+            "id": "m",
+            "provider_name": "P",
+            "intelligence_index": 40.0,
+            "context_length": 1000,
+            "provider_blended_per_mtok": 1.0,
+            "model_blended_per_mtok": 2.0,
+            "delta_vs_model": -1.0,
+            "throughput_avg": 10.0,
+            "throughput_percentiles": {},
+        }
+        assert "endpoint: P" in hover_text({**base, "zdr": None})
+
+    def test_retention_enum_values(self):
+        assert {r.value for r in Retention} == {"all", "zdr", "non-zdr"}

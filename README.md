@@ -92,17 +92,25 @@ length, and the blended price alongside the raw `prompt`, `completion`, and
 `cache_read` rates it was derived from, so the blend can be checked by hand.
 
 The provider table expands the top models across every endpoint serving them.
-The same model can appear several times at different prices and speeds: `:batch`
-variants often cost half and serve a small fraction of the throughput, and
-Azure mirrors OpenAI at the same price.
+Each row is one model@endpoint pair labeled `Provider/qualifier` (for example
+`OpenAI/flex` or `BaseTen/fp4`), because the same provider often serves the
+same model at different prices and speeds. The same model can appear several
+times: `:batch` variants often cost half and serve a small fraction of the
+throughput, and Azure mirrors OpenAI at the same price.
 
 | Column | Meaning |
 | --- | --- |
-| `MODEL_B` / `PROV_B` | Blended $/Mtok at the model level / at this provider |
-| `DELTA` | `PROV_B - MODEL_B`; negative means the provider is cheaper |
-| `CR?` | `~` marks a provider with no `input_cache_read` price |
+| `ENDPOINT` | `Provider/qualifier` endpoint label derived from the provider tag |
+| `MODEL_B` / `PROV_B` | Blended $/Mtok at the model level / at this endpoint |
+| `DELTA` | `PROV_B - MODEL_B`; negative means the endpoint is cheaper |
+| `CR?` | `~` marks an endpoint with no `input_cache_read` price |
+| `ZDR` | Zero data retention: `yes`, `no`, or `?` when unreachable |
 | `TPS_AVG` | Mean of the reported throughput percentiles |
 | `INTL` | Artificial Analysis intelligence index |
+
+Filter endpoints by data retention with `--retention zdr` (zero-retention only)
+or `--retention non-zdr`. The plot shows one point per model@endpoint row, and
+hovering a point names the endpoint.
 
 ## Options
 
@@ -121,7 +129,8 @@ Azure mirrors OpenAI at the same price.
 | `--descending` | off | Reverse the sort order |
 | `--no-providers` | off | Skip the per-provider join |
 | `--provider-limit` | `0` | Cap provider rows per model (`0` = no cap) |
-| `--provider-sort` | `provider` | `provider`, `delta`, `model`, `name` |
+| `--provider-sort` | `provider` | `provider`, `delta`, `model`, `name` (endpoint label) |
+| `--retention` | `all` | `all`, `zdr`, or `non-zdr` endpoint data-retention filter |
 | `--provider-workers` | `6` | Parallel endpoint requests |
 | `--tps` | `avg` | `avg` or `percentiles` for the throughput column |
 | `--plot PATH` | none | Write an interactive HTML scatter |
@@ -134,7 +143,7 @@ Azure mirrors OpenAI at the same price.
 
 ```bash
 uv sync --extra dev
-uv run pytest        # 53 tests, no network
+uv run pytest        # 70+ tests, no network
 uv run ruff check .
 uv run ruff format .
 ```

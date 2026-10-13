@@ -1,2 +1,0 @@
-[console_scripts]
-price-frontier = price_frontier:app

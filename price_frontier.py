@@ -13,10 +13,10 @@ Blended cost model (defaults):
     routes a portion of them at input_cache_write
   - output tokens = --output-ratio (0.01) * input tokens, priced at completion
 
-The top --limit models are expanded per provider via /models/{id}/endpoints and
-joined on provider name, so each model/provider row carries both the model-level
-and provider-level blended price. Output is a table, JSON, or an interactive
---plot of cost against throughput.
+The top --limit models are expanded per endpoint via /models/{id}/endpoints and
+joined on (model, provider, tag), so each model@endpoint row carries both the
+model-level and endpoint-level blended price. Output is a table, JSON, or an
+interactive --plot of cost against throughput.
 """
 
 from __future__ import annotations
@@ -57,6 +57,12 @@ class ProviderSort(str, Enum):
     DELTA = "delta"
     MODEL = "model"
     NAME = "name"
+
+
+class Retention(str, Enum):
+    ALL = "all"
+    ZDR = "zdr"
+    NON_ZDR = "non-zdr"
 
 
 def fail(message: str) -> NoReturn:
@@ -119,6 +125,27 @@ def base_model_id(model_id: str) -> str:
     return model_id.split(":", 1)[0]
 
 
+def endpoint_label(provider_name: Any, tag: Any) -> str:
+    """Display label for one serving endpoint: Provider/qualifier.
+
+    The raw `tag` is usually "<provider-slug>/<qualifier>" (e.g. "openai/flex",
+    "baseten/fp4"), so the qualifier is what distinguishes two rows from the
+    same provider. A bare tag that just repeats the provider slug collapses to
+    the provider name alone ("azure" -> "Azure").
+    """
+    provider = str(provider_name or "unknown")
+    raw = str(tag or "").strip()
+    if not raw:
+        return provider
+    if "/" in raw:
+        qualifier = raw.rsplit("/", 1)[-1].strip()
+        return f"{provider}/{qualifier}" if qualifier else provider
+    slug = re.sub(r"[^a-z0-9]+", "", provider.lower())
+    if re.sub(r"[^a-z0-9]+", "", raw.lower()) == slug:
+        return provider
+    return f"{provider}/{raw}"
+
+
 def fetch_endpoints(
     session: requests.Session,
     model_id: str,
@@ -135,6 +162,48 @@ def fetch_endpoints(
         return []
     endpoints = data.get("endpoints")
     return endpoints if isinstance(endpoints, list) else []
+
+
+def zdr_key(model_id: str, provider_name: Any, tag: Any) -> tuple[str, str, str]:
+    """Join key between per-model endpoints and the global ZDR endpoint list.
+
+    Both payloads carry the same (model_id, provider_name, tag) triple, so a
+    set of these triples marks every endpoint with a Zero Data Retention
+    policy. Tag may be absent; normalize it to "" so a missing tag still joins.
+    """
+    return (
+        base_model_id(str(model_id)),
+        str(provider_name or "unknown"),
+        str(tag or ""),
+    )
+
+
+def fetch_zdr_keys(
+    session: requests.Session,
+    base: str = API_BASE,
+    timeout: float = 30.0,
+) -> set[tuple[str, str, str]] | None:
+    """ZDR endpoint triples, or None when the list cannot be fetched.
+
+    None (unknown) is distinct from an empty set (no endpoint is ZDR): callers
+    need the difference so a requested --retention filter can fail loudly
+    instead of silently dropping every row.
+    """
+    try:
+        payload = _get_json(session, f"{base}/endpoints/zdr", timeout)
+    except (requests.RequestException, ValueError, OSError):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    keys: set[tuple[str, str, str]] = set()
+    for ep in data:
+        if not isinstance(ep, dict):
+            continue
+        keys.add(
+            zdr_key(ep.get("model_id", ""), ep.get("provider_name"), ep.get("tag"))
+        )
+    return keys
 
 
 def to_float(value: Any) -> float | None:
@@ -300,6 +369,22 @@ def money(value: float | None) -> str:
     return "-" if value is None else f"${value:,.3f}"
 
 
+def retention_label(zdr: bool | None) -> str:
+    if zdr is True:
+        return "zero-retention"
+    if zdr is False:
+        return "retains"
+    return "unknown"
+
+
+def retention_mark(zdr: bool | None) -> str:
+    if zdr is True:
+        return "yes"
+    if zdr is False:
+        return "no"
+    return "?"
+
+
 def plot_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Rows that can actually be placed: needs both throughput and price.
 
@@ -321,7 +406,7 @@ def hover_text(row: dict[str, Any]) -> str:
     pcts = row["throughput_percentiles"]
     lines = [
         f"<b>{row['id']}</b>",
-        f"provider: {row['provider_name']}",
+        f"endpoint: {row.get('endpoint') or row['provider_name']}",
     ]
     if row.get("quantization") and row["quantization"] != "unknown":
         lines.append(f"quantization: {row['quantization']}")
@@ -331,6 +416,7 @@ def hover_text(row: dict[str, Any]) -> str:
         f"blended: {money(row['provider_blended_per_mtok'])}/Mtok",
         f"model blended: {money(row['model_blended_per_mtok'])}/Mtok",
         f"delta: {money(row['delta_vs_model'])}",
+        f"retention: {retention_label(row.get('zdr'))}",
         f"throughput avg: {row['throughput_avg']:.0f} tok/s",
     ]
     if pcts:
@@ -389,14 +475,14 @@ def write_plot(
                 "opacity": 0.85,
                 "showscale": True,
             },
-            name="model@provider",
+            name="model@endpoint",
         )
     )
 
     fig.update_layout(
         title={
             "text": (
-                "Cost vs throughput by model@provider"
+                "Cost vs throughput by model@endpoint"
                 f"<br><sup>color and size = intelligence index | "
                 f"cache_hit={cache_hit_rate:.0%}, output_ratio={output_ratio:.0%}, "
                 f"cache_write_share={cache_write_share:.0%}</sup>"
@@ -424,7 +510,7 @@ def write_plot(
         fg=typer.colors.GREEN,
     )
     typer.echo(
-        "open it in a browser and hover a point for the model, provider, "
+        "open it in a browser and hover a point for the model, endpoint, "
         "and full price/throughput breakdown"
     )
 
@@ -438,6 +524,7 @@ class Settings:
     cache_write_share: float
     provider_workers: int
     sessions: SessionFactory
+    zdr_keys: set[tuple[str, str, str]] | None = None
 
 
 def build_provider_rows(
@@ -468,13 +555,28 @@ def build_provider_rows(
                 provider_name = str(
                     ep.get("provider_name") or ep.get("name") or "unknown"
                 )
+                tag = ep.get("tag")
+                endpoint = endpoint_label(ep.get("provider_name"), tag)
                 pcts = throughput_percentiles(ep)
                 quantization = ep.get("quantization")
                 ctx = to_float(ep.get("context_length")) or row["context_length"]
+                if cfg.zdr_keys is None:
+                    zdr: bool | None = None
+                else:
+                    zdr = (
+                        zdr_key(
+                            ep.get("model_id", row["id"]),
+                            ep.get("provider_name"),
+                            ep.get("tag"),
+                        )
+                        in cfg.zdr_keys
+                    )
                 rows.append(
                     {
                         "id": row["id"],
                         "provider_name": provider_name,
+                        "provider_tag": tag,
+                        "endpoint": endpoint,
                         "provider_endpoint_name": ep.get("name"),
                         "quantization": quantization,
                         "context_length": int(ctx),
@@ -496,6 +598,7 @@ def build_provider_rows(
                         "throughput_avg": (sum(pcts.values()) / len(pcts))
                         if pcts
                         else None,
+                        "zdr": zdr,
                         "pricing": pricing,
                     }
                 )
@@ -587,6 +690,14 @@ def main(
     provider_sort: Annotated[ProviderSort, typer.Option("--provider-sort")] = (
         ProviderSort.PROVIDER
     ),
+    retention: Annotated[
+        Retention,
+        typer.Option(
+            "--retention",
+            help="provider data-retention filter: all, zdr (zero data "
+            "retention only), or non-zdr",
+        ),
+    ] = Retention.ALL,
     api_key: Annotated[
         str | None,
         typer.Option(
@@ -684,7 +795,16 @@ def main(
     models_shown = rows[:limit]
 
     provider_rows: list[dict[str, Any]] = []
+    zdr_keys: set[tuple[str, str, str]] | None = None
     if not no_providers and models_shown:
+        # One extra request marks every provider row ZDR or not, so the
+        # retention filter and the ZDR column never depend on per-model data.
+        zdr_keys = fetch_zdr_keys(session, api_base, timeout)
+        if retention is not Retention.ALL and zdr_keys is None:
+            fail(
+                f"could not fetch the ZDR endpoint list from {api_base}, "
+                "so --retention cannot be applied; retry or use --retention all"
+            )
         provider_rows = build_provider_rows(
             models_shown,
             Settings(
@@ -695,13 +815,18 @@ def main(
                 cache_write_share=cache_write_share,
                 provider_workers=provider_workers,
                 sessions=sessions,
+                zdr_keys=zdr_keys,
             ),
         )
+        if retention is Retention.ZDR:
+            provider_rows = [r for r in provider_rows if r["zdr"] is True]
+        elif retention is Retention.NON_ZDR:
+            provider_rows = [r for r in provider_rows if r["zdr"] is False]
         pkey = {
             ProviderSort.PROVIDER: lambda r: r["provider_blended_per_mtok"],
             ProviderSort.DELTA: lambda r: r["delta_vs_model"],
             ProviderSort.MODEL: lambda r: r["model_blended_per_mtok"],
-            ProviderSort.NAME: lambda r: r["provider_name"],
+            ProviderSort.NAME: lambda r: r.get("endpoint") or r["provider_name"],
         }[provider_sort]
         provider_rows.sort(key=pkey)
         if provider_limit > 0:
@@ -721,6 +846,7 @@ def main(
         "cache_write_share": cache_write_share,
         "min_intelligence": min_intelligence,
         "limit": limit,
+        "retention": retention.value,
     }
 
     if plot:
@@ -744,7 +870,7 @@ def main(
     print(
         f"models matched: {len(rows)}   showing: {len(models_shown)}   "
         f"(cache_hit={cache_hit_rate:.0%}, output_ratio={output_ratio:.0%}, "
-        f"cache_write_share={cache_write_share:.0%})"
+        f"cache_write_share={cache_write_share:.0%}, retention={retention.value})"
     )
 
     header = (
@@ -769,18 +895,23 @@ def main(
     if no_providers:
         print("\n(per-provider join skipped: --no-providers)")
     elif not provider_rows:
-        print("\nno provider endpoint data returned")
+        if retention is not Retention.ALL:
+            print(
+                f"\nno provider endpoint data returned for --retention {retention.value}"
+            )
+        else:
+            print("\nno provider endpoint data returned")
     else:
         print(
-            f"\njoined on provider name - {len(provider_rows)} rows across "
+            f"\njoined on endpoint - {len(provider_rows)} rows across "
             f"{len({r['id'] for r in provider_rows})} models"
         )
         tps_col = "TPS_AVG" if tps is TpsMode.AVG else "TPS 50/75/90/95/99"
         tps_width = 8 if tps is TpsMode.AVG else 17
         pheader = (
-            f"{'PROVIDER':<22} {'MODEL':<46} {'QUANT':<10} {tps_col:>{tps_width}} "
+            f"{'ENDPOINT':<24} {'MODEL':<46} {'QUANT':<10} {tps_col:>{tps_width}} "
             f"{'MODEL_B':>11} {'PROV_B':>11} {'DELTA':>11} {'P_PROMPT':>10} "
-            f"{'P_COMPL':>10} {'P_CR':>9} {'CR?':>3}"
+            f"{'P_COMPL':>10} {'P_CR':>9} {'CR?':>3} {'ZDR':>3}"
         )
         print(pheader)
         print("-" * len(pheader))
@@ -802,7 +933,7 @@ def main(
                     else "-"
                 )
             print(
-                f"{r['provider_name'][:22]:<22} {(r['id'] + ' ' + intl)[:46]:<46} "
+                f"{(r.get('endpoint') or r['provider_name'])[:24]:<24} {(r['id'] + ' ' + intl)[:46]:<46} "
                 f"{quant:<10} {tps_val:>{tps_width}} "
                 f"{money(r['model_blended_per_mtok']):>11} "
                 f"{money(r['provider_blended_per_mtok']):>11} "
@@ -810,7 +941,8 @@ def main(
                 f"{money(r['provider_prompt_per_mtok']):>10} "
                 f"{money(r['provider_completion_per_mtok']):>10} "
                 f"{money(r['provider_cache_read_per_mtok']):>9} "
-                f"{'' if r['provider_cache_read_priced'] else '~':>3}"
+                f"{'' if r['provider_cache_read_priced'] else '~':>3} "
+                f"{retention_mark(r.get('zdr')):>3}"
             )
 
     print(
@@ -821,6 +953,9 @@ def main(
     )
     print(
         "DELTA = provider_blended - model_blended (negative = provider is cheaper than the model row)"
+    )
+    print(
+        "ZDR = zero data retention: yes/no/? (unknown when the ZDR list is unreachable)"
     )
     if any(not r["throughput_percentiles"] for r in provider_rows) and not api_key:
         print(

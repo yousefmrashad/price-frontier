@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 build/
+*.egg-info/
+*.egg
 # plot output
 *.html
 *.svg
