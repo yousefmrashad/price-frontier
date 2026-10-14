@@ -10,3 +10,4 @@ build/
 *.html
 *.svg
 *.png
+!docs/*.png

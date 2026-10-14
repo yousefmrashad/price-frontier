@@ -9,6 +9,13 @@ provider than another. `price-frontier` collapses all of that into one
 comparable number, at the model level and per provider, then shows the
 result as a table, JSON, or an interactive cost-versus-throughput plot.
 
+![Cost vs throughput by model@endpoint](docs/frontier.png)
+
+*Blended $/Mtok against throughput for zero-retention endpoints, generated
+with `price-frontier --min-intelligence 34 --descending --plot plot.html
+--exclude batch --retention zdr`. Hovering a point in the interactive HTML
+names the model@endpoint with the full price and throughput breakdown.*
+
 ## Why blended pricing
 
 The naive reading of a price card assumes every input token is fresh and that
