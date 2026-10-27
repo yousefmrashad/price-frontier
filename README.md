@@ -128,7 +128,7 @@ hovering a point names the endpoint.
 | `--cache-write-share` | `0.0` | Fraction of uncached input billed as cache writes |
 | `--min-intelligence` | none | Drop models below this intelligence index |
 | `--with-intelligence-only` | off | Require an intelligence index |
-| `--max-blended` | none | Cap the blended $/Mtok |
+| `--max-blended` | none | Cap blended $/Mtok for models and endpoints |
 | `--min-context` | `0` | Minimum context length |
 | `--include` / `--exclude` | none | Case-insensitive regex on model id or name |
 | `--limit` | `10` | Models to expand per provider |

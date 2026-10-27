@@ -309,6 +309,20 @@ def blended_per_mtok(
 PERCENTILE_KEYS = (50, 75, 90, 95, 99)
 
 
+def cap_blended(
+    rows: list[dict[str, Any]], max_blended: float | None
+) -> list[dict[str, Any]]:
+    """Drop endpoint rows above the blended cap.
+
+    --max-blended filters models before the endpoint fan-out, but one model can
+    be served far above its model-level price (a mispriced or premium endpoint),
+    so the cap has to be re-applied to the endpoint rows too.
+    """
+    if max_blended is None:
+        return rows
+    return [r for r in rows if r["provider_blended_per_mtok"] <= max_blended]
+
+
 def throughput_percentiles(endpoint: dict[str, Any]) -> dict[int, float]:
     """Extract {percentile: tokens/sec} from an endpoint's throughput field.
 
@@ -657,7 +671,7 @@ def main(
         float | None,
         typer.Option(
             "--max-blended",
-            help="only show models at or below this $/Mtok blended price",
+            help="only show models and endpoints at or below this $/Mtok blended price",
         ),
     ] = None,
     min_context: Annotated[
@@ -842,6 +856,7 @@ def main(
             provider_rows = [r for r in provider_rows if r["zdr"] is True]
         elif retention is Retention.NON_ZDR:
             provider_rows = [r for r in provider_rows if r["zdr"] is False]
+        provider_rows = cap_blended(provider_rows, max_blended)
         pkey = {
             ProviderSort.PROVIDER: lambda r: r["provider_blended_per_mtok"],
             ProviderSort.DELTA: lambda r: r["delta_vs_model"],

@@ -12,6 +12,7 @@ from price_frontier import (
     base_model_id,
     blended_per_mtok,
     build_provider_rows,
+    cap_blended,
     endpoint_label,
     fetch_zdr_keys,
     hover_text,
@@ -277,6 +278,26 @@ class TestHoverText:
     def test_omits_percentile_line_when_empty(self):
         text = hover_text(self.row(throughput_percentiles={}))
         assert "p50/75" not in text
+
+
+class TestCapBlended:
+    def _row(self, price: float) -> dict[str, float]:
+        return {"provider_blended_per_mtok": price}
+
+    def test_none_keeps_every_row(self):
+        rows = [self._row(0.01), self._row(99.0)]
+        assert cap_blended(rows, None) == rows
+
+    def test_drops_rows_above_cap(self):
+        rows = [self._row(0.05), self._row(19.167)]
+        assert cap_blended(rows, 1.0) == [rows[0]]
+
+    def test_keeps_row_exactly_at_cap(self):
+        row = self._row(1.0)
+        assert cap_blended([row], 1.0) == [row]
+
+    def test_all_above_cap_returns_empty(self):
+        assert cap_blended([self._row(50.0)], 1.0) == []
 
 
 class TestPlotPath:
