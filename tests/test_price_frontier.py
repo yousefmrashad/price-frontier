@@ -343,8 +343,18 @@ class TestInjectPlotSearch:
         html = page.read_text()
         assert html.index('id="pf-panel"') < html.index('id="pf-plot"')
         assert 'id="pf-search"' in html
-        assert "marker.size" in html
         assert html.index("Plotly.restyle") < html.index("</body>")
+
+    def test_filter_removes_points_instead_of_only_shrinking(self, tmp_path):
+        # With hoverdistance=-1 a zero-size marker still answers hover, so the
+        # filter has to drop x/y/text, not just the marker size.
+        page = tmp_path / "plot.html"
+        page.write_text('<html><body><div id="pf-plot"></div></body></html>')
+        inject_plot_search(str(page))
+        script = page.read_text()
+        assert "x: [keep.map(" in script
+        assert "y: [keep.map(" in script
+        assert "text: [keep.map(" in script
 
     def test_leaves_page_without_plot_div_untouched(self, tmp_path):
         page = tmp_path / "plot.html"

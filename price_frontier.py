@@ -506,9 +506,8 @@ def plot_path(raw: str) -> str:
 PLOT_DIV_ID = "pf-plot"
 
 # Plotly has no built-in search, so the written page gets a small filter box
-# above the chart. Points are hidden by zeroing their marker size: plotly's
-# restyle collapses a per-point marker.opacity array to a single scalar, which
-# made every point inherit the first point's opacity.
+# above the chart. Non-matching points are removed from each trace's arrays,
+# which keeps them out of hover as well as out of view.
 PLOT_SEARCH_PANEL = """
 <div id="pf-panel" style="margin:10px 12px 0;background:#fff;border:1px solid #d0d7de;
   border-radius:8px;padding:8px 10px;font:13px/1.4 system-ui,sans-serif;
@@ -527,33 +526,47 @@ PLOT_SEARCH_SCRIPT = """
   var box = document.getElementById("pf-search");
   var count = document.getElementById("pf-count");
   if (!gd || !box || !count) return;
-  // Cache each trace's full point size so clearing the query restores it.
-  var baseSizes = gd.data.map(function (trace) {
-    var n = (trace.text || []).length;
-    var size = trace.marker && trace.marker.size;
-    if (Array.isArray(size)) return size.slice();
-    var one = typeof size === "number" ? size : 12;
-    return Array.from({length: n}, function () { return one; });
+  // Keep the full series so clearing the query restores every point. Points
+  // are removed from x/y/text rather than shrunk, because with
+  // hoverdistance=-1 a zero-size marker still answers hover.
+  var base = gd.data.map(function (trace) {
+    return {
+      x: (trace.x || []).slice(),
+      y: (trace.y || []).slice(),
+      text: (trace.text || []).slice(),
+      size: Array.isArray(trace.marker && trace.marker.size)
+        ? trace.marker.size.slice() : null,
+      color: Array.isArray(trace.marker && trace.marker.color)
+        ? trace.marker.color.slice() : null
+    };
   });
   function apply() {
     var term = box.value.trim().toLowerCase();
     var total = 0, hits = 0;
     gd.data.forEach(function (trace, i) {
-      var texts = trace.text || [];
-      var match = texts.map(function (t) {
-        return !term || String(t).toLowerCase().indexOf(term) !== -1;
+      var texts = base[i].text;
+      var keep = [];
+      texts.forEach(function (t, j) {
+        if (!term || String(t).toLowerCase().indexOf(term) !== -1) keep.push(j);
       });
-      // The frontier duplicates rows from the main trace, so only count the
-      // main trace in the badge.
+      // The frontier duplicates rows from the main trace, so only the main
+      // trace contributes to the badge.
       if (trace.name !== "Pareto frontier") {
-        match.forEach(function (m) { if (m) hits++; });
-        total += match.length;
+        hits += keep.length;
+        total += texts.length;
       }
-      var sizes = baseSizes[i].map(function (s, j) { return match[j] ? s : 0; });
-      Plotly.restyle(gd, {
-        "marker.size": [sizes],
-        "opacity": [match.some(Boolean) ? 1 : 0]
-      }, [i]);
+      var upd = {
+        x: [keep.map(function (j) { return base[i].x[j]; })],
+        y: [keep.map(function (j) { return base[i].y[j]; })],
+        text: [keep.map(function (j) { return base[i].text[j]; })]
+      };
+      if (base[i].size) {
+        upd["marker.size"] = [keep.map(function (j) { return base[i].size[j]; })];
+      }
+      if (base[i].color) {
+        upd["marker.color"] = [keep.map(function (j) { return base[i].color[j]; })];
+      }
+      Plotly.restyle(gd, upd, [i]);
     });
     count.textContent = term ? hits + " / " + total + " points" : total + " points";
   }
