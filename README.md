@@ -72,8 +72,10 @@ own headline price:
 price-frontier --limit 6 --provider-sort delta
 ```
 
-Write an interactive plot and open it in a browser. Hovering a point names the
-model and provider, with the full price and throughput breakdown:
+Write an interactive plot and open it in a browser. Points are searchable by
+model or endpoint slug, and the Pareto frontier (nothing faster and cheaper) is
+drawn over them. Hovering a point names the model and endpoint, with the full
+price and throughput breakdown:
 
 ```bash
 price-frontier --limit 30 --plot frontier.html --provider-sort delta
@@ -99,15 +101,17 @@ length, and the blended price alongside the raw `prompt`, `completion`, and
 `cache_read` rates it was derived from, so the blend can be checked by hand.
 
 The provider table expands the top models across every endpoint serving them.
-Each row is one model@endpoint pair labeled `Provider/qualifier` (for example
-`OpenAI/flex` or `BaseTen/fp4`), because the same provider often serves the
-same model at different prices and speeds. The same model can appear several
-times: `:batch` variants often cost half and serve a small fraction of the
-throughput, and Azure mirrors OpenAI at the same price.
+Each row is one model@endpoint pair labeled with the endpoint's routing tag
+exactly as OpenRouter exposes it (for example `openai/flex`, `baseten/fp4`, or
+`google-vertex/global/priority`), so the label can be pasted straight into
+provider preferences. The same provider often serves the same model at
+different prices and speeds, so those suffixes matter. The same model can
+appear several times: `:batch` variants often cost half and serve a small
+fraction of the throughput, and Azure mirrors OpenAI at the same price.
 
 | Column | Meaning |
 | --- | --- |
-| `ENDPOINT` | `Provider/qualifier` endpoint label derived from the provider tag |
+| `ENDPOINT` | Routing tag, e.g. `openai/flex` (matches the configurable provider slug) |
 | `MODEL_B` / `PROV_B` | Blended $/Mtok at the model level / at this endpoint |
 | `DELTA` | `PROV_B - MODEL_B`; negative means the endpoint is cheaper |
 | `CR?` | `~` marks an endpoint with no `input_cache_read` price |

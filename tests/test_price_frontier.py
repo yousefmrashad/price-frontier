@@ -17,9 +17,11 @@ from price_frontier import (
     fetch_zdr_keys,
     hover_text,
     intelligence_index,
+    pareto_points,
     parse_percentile,
     plot_path,
     plot_points,
+    provider_slug,
     retention_label,
     retention_mark,
     throughput_percentiles,
@@ -280,6 +282,38 @@ class TestHoverText:
         assert "p50/75" not in text
 
 
+class TestParetoPoints:
+    def _row(self, tps: float, price: float) -> dict[str, Any]:
+        return {
+            "throughput_avg": tps,
+            "provider_blended_per_mtok": price,
+            "intelligence_index": 40.0,
+        }
+
+    def test_drops_dominated_points(self):
+        slow_cheap = self._row(10, 1.0)
+        fast_cheap = self._row(20, 1.0)
+        slow_expensive = self._row(10, 5.0)
+        assert pareto_points([slow_cheap, fast_cheap, slow_expensive]) == [fast_cheap]
+
+    def test_keeps_tradeoff_points(self):
+        slow_cheap = self._row(10, 1.0)
+        fast_pricey = self._row(100, 9.0)
+        assert pareto_points([slow_cheap, fast_pricey]) == [slow_cheap, fast_pricey]
+
+    def test_ties_are_all_kept(self):
+        a, b = self._row(10, 1.0), self._row(10, 1.0)
+        assert pareto_points([a, b]) == [a, b]
+
+    def test_rows_without_throughput_are_ignored(self):
+        complete = self._row(10, 1.0)
+        incomplete = {**self._row(50, 0.5), "throughput_avg": None}
+        assert pareto_points([complete, incomplete]) == [complete]
+
+    def test_empty_input(self):
+        assert pareto_points([]) == []
+
+
 class TestCapBlended:
     def _row(self, price: float) -> dict[str, float]:
         return {"provider_blended_per_mtok": price}
@@ -331,26 +365,42 @@ class TestZdrKey:
 
 
 class TestEndpointLabel:
-    def test_qualified_tag_keeps_provider_and_qualifier(self):
-        assert endpoint_label("OpenAI", "openai/flex") == "OpenAI/flex"
-        assert endpoint_label("BaseTen", "baseten/fp4") == "BaseTen/fp4"
+    def test_returns_tag_verbatim(self):
+        assert endpoint_label("OpenAI", "openai/flex") == "openai/flex"
+        assert endpoint_label("BaseTen", "baseten/fp4") == "baseten/fp4"
 
-    def test_nested_tag_uses_last_segment(self):
-        assert endpoint_label("Azure", "azure/swedencentral") == "Azure/swedencentral"
+    def test_keeps_full_nested_qualifier(self):
+        assert (
+            endpoint_label("Google", "google-vertex/global/priority")
+            == "google-vertex/global/priority"
+        )
 
-    def test_bare_tag_matching_provider_collapses(self):
-        assert endpoint_label("Azure", "azure") == "Azure"
-        assert endpoint_label("OpenAI", "openai") == "OpenAI"
+    def test_bare_slug_tag_is_kept(self):
+        assert endpoint_label("Azure", "azure") == "azure"
+        assert endpoint_label("OpenAI", "openai") == "openai"
 
-    def test_bare_tag_not_matching_provider_is_kept(self):
-        assert endpoint_label("Foo", "fast") == "Foo/fast"
+    def test_missing_tag_falls_back_to_slugified_name(self):
+        assert endpoint_label("Phala", None) == "phala"
+        assert endpoint_label("Phala", "") == "phala"
+        assert (
+            endpoint_label("Claude Platform on AWS", None) == "claude-platform-on-aws"
+        )
 
-    def test_missing_tag_is_provider_only(self):
-        assert endpoint_label("Phala", None) == "Phala"
-        assert endpoint_label("Phala", "") == "Phala"
+    def test_missing_provider_uses_tag(self):
+        assert endpoint_label(None, "openai/flex") == "openai/flex"
 
-    def test_missing_provider_is_unknown(self):
-        assert endpoint_label(None, "openai/flex") == "unknown/flex"
+
+class TestProviderSlug:
+    def test_tag_prefix_is_the_slug(self):
+        assert provider_slug("OpenAI", "openai/flex") == "openai"
+        assert provider_slug("BaseTen", "baseten/fp8/us") == "baseten"
+
+    def test_bare_tag_is_the_slug(self):
+        assert provider_slug("Phala", "phala") == "phala"
+
+    def test_missing_tag_slugifies_display_name(self):
+        assert provider_slug("Claude Platform on AWS", None) == "claude-platform-on-aws"
+        assert provider_slug(None, None) == "unknown"
 
 
 class FakeResponse:
@@ -516,8 +566,9 @@ class TestBuildProviderRowsZdr:
                 set(),
             ),
         )
-        assert rows[0]["endpoint"] == "OpenAI/flex"
+        assert rows[0]["endpoint"] == "openai/flex"
         assert rows[0]["provider_tag"] == "openai/flex"
+        assert rows[0]["provider_slug"] == "openai"
 
     def test_uptime_percent_scale_normalized_to_fraction(
         self, monkeypatch: pytest.MonkeyPatch

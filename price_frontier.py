@@ -138,25 +138,31 @@ def base_model_id(model_id: str) -> str:
     return model_id.split(":", 1)[0]
 
 
-def endpoint_label(provider_name: Any, tag: Any) -> str:
-    """Display label for one serving endpoint: Provider/qualifier.
+def provider_slug(provider_name: Any, tag: Any) -> str:
+    """Routing slug for the provider, e.g. "openai" or "baseten".
 
-    The raw `tag` is usually "<provider-slug>/<qualifier>" (e.g. "openai/flex",
-    "baseten/fp4"), so the qualifier is what distinguishes two rows from the
-    same provider. A bare tag that just repeats the provider slug collapses to
-    the provider name alone ("azure" -> "Azure").
+    OpenRouter's provider preferences are configured with these slugs, and the
+    endpoint tag is always "<slug>[/<qualifier>...]", so the tag is the exact
+    source when present. Fall back to slugifying the display name.
     """
-    provider = str(provider_name or "unknown")
     raw = str(tag or "").strip()
-    if not raw:
-        return provider
-    if "/" in raw:
-        qualifier = raw.rsplit("/", 1)[-1].strip()
-        return f"{provider}/{qualifier}" if qualifier else provider
-    slug = re.sub(r"[^a-z0-9]+", "", provider.lower())
-    if re.sub(r"[^a-z0-9]+", "", raw.lower()) == slug:
-        return provider
-    return f"{provider}/{raw}"
+    if raw:
+        return raw.split("/", 1)[0]
+    return re.sub(r"[^a-z0-9]+", "-", str(provider_name or "unknown").lower()).strip(
+        "-"
+    )
+
+
+def endpoint_label(provider_name: Any, tag: Any) -> str:
+    """Display label for one serving endpoint, exactly as configured.
+
+    The tag is the routing tag OpenRouter accepts in provider preferences
+    ("openai/flex", "baseten/fp4", "google-vertex/global/priority"), so it is
+    shown verbatim rather than rebuilt from the display name. Only when a tag
+    is missing does this fall back to the provider slug.
+    """
+    raw = str(tag or "").strip()
+    return raw if raw else provider_slug(provider_name, tag)
 
 
 def fetch_endpoints(
@@ -412,6 +418,38 @@ def retention_mark(zdr: bool | None) -> str:
     return "?"
 
 
+def pareto_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Non-dominated rows: no other point is both faster and cheaper.
+
+    Ties are kept (neither strictly better), so a duplicated endpoint is not
+    silently collapsed. Rows without throughput or price are excluded upstream
+    by plot_points().
+    """
+    points = plot_points(rows)
+    frontier: list[dict[str, Any]] = []
+    for candidate in points:
+        dominated = False
+        for other in points:
+            if other is candidate:
+                continue
+            faster = other["throughput_avg"] >= candidate["throughput_avg"]
+            cheaper = (
+                other["provider_blended_per_mtok"]
+                <= candidate["provider_blended_per_mtok"]
+            )
+            strictly_better = (
+                other["throughput_avg"] > candidate["throughput_avg"]
+                or other["provider_blended_per_mtok"]
+                < candidate["provider_blended_per_mtok"]
+            )
+            if faster and cheaper and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(candidate)
+    return frontier
+
+
 def plot_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Rows that can actually be placed: needs both throughput and price.
 
@@ -451,6 +489,8 @@ def hover_text(row: dict[str, Any]) -> str:
             "p50/75/90/95/99: "
             + "/".join(f"{pcts[p]:.0f}" for p in PERCENTILE_KEYS if p in pcts)
         )
+    if row.get("pareto"):
+        lines.append("pareto: optimal")
     if row.get("uptime") is not None:
         lines.append(f"uptime 30m: {row['uptime'] * 100:.1f}%")
     if row.get("latency") is not None:
@@ -461,6 +501,59 @@ def hover_text(row: dict[str, Any]) -> str:
 def plot_path(raw: str) -> str:
     """Default to .html so `--plot chart` still opens as an interactive page."""
     return raw if Path(raw).suffix else f"{raw}.html"
+
+
+PLOT_DIV_ID = "pf-plot"
+
+# Plotly has no built-in search, so the written page gets a small filter box.
+# It dims every point whose hover text does not contain the query, which lets
+# you isolate a model or endpoint by slug on a crowded chart.
+PLOT_SEARCH_HTML = """
+<div id="pf-panel" style="position:fixed;top:12px;left:12px;z-index:1000;
+  background:rgba(255,255,255,.95);border:1px solid #d0d7de;border-radius:8px;
+  padding:8px 10px;font:13px/1.4 system-ui,sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.08)">
+  <label for="pf-search" style="font-weight:600;margin-right:6px">Search</label>
+  <input id="pf-search" type="search" placeholder="model or endpoint slug"
+    style="width:230px;padding:4px 6px;border:1px solid #c8d1da;border-radius:5px" />
+  <span id="pf-count" style="margin-left:8px;color:#57606a"></span>
+</div>
+<script>
+(function () {
+  var gd = document.getElementById("%s");
+  var box = document.getElementById("pf-search");
+  var count = document.getElementById("pf-count");
+  if (!gd || !box || !count) return;
+  function apply() {
+    var term = box.value.trim().toLowerCase();
+    var total = 0, hits = 0;
+    gd.data.forEach(function (trace, i) {
+      var texts = trace.text || [];
+      var match = texts.map(function (t) {
+        return !term || String(t).toLowerCase().indexOf(term) !== -1;
+      });
+      var base = trace.name === "Pareto frontier" ? 1 : 0.85;
+      match.forEach(function (m) { if (m) hits++; });
+      total += match.length;
+      Plotly.restyle(gd, {
+        "marker.opacity": match.map(function (m) { return m ? base : 0.05; })
+      }, [i]);
+    });
+    count.textContent = term ? hits + " / " + total + " points" : total + " points";
+  }
+  box.addEventListener("input", apply);
+  apply();
+})();
+</script>
+"""
+
+
+def inject_plot_search(path: str) -> None:
+    """Add the search box to a written plot page, before </body>."""
+    html = Path(path).read_text(encoding="utf-8")
+    if "</body>" not in html:
+        return
+    panel = PLOT_SEARCH_HTML % PLOT_DIV_ID
+    Path(path).write_text(html.replace("</body>", panel + "</body>"), encoding="utf-8")
 
 
 def write_plot(
@@ -481,6 +574,8 @@ def write_plot(
 
     # Imported lazily so the table and JSON paths do not pay for it.
     import plotly.graph_objects as go
+
+    frontier = sorted(pareto_points(points), key=lambda r: r["throughput_avg"])
 
     fig = go.Figure(
         go.Scatter(
@@ -506,6 +601,25 @@ def write_plot(
         )
     )
 
+    if frontier:
+        fig.add_trace(
+            go.Scatter(
+                x=[r["throughput_avg"] for r in frontier],
+                y=[r["provider_blended_per_mtok"] for r in frontier],
+                text=[hover_text(r) for r in frontier],
+                hovertemplate="%{text}<extra></extra>",
+                mode="lines+markers",
+                line={"color": "#111", "width": 1.4, "dash": "dot"},
+                marker={
+                    "symbol": "diamond-open",
+                    "size": 15,
+                    "color": "#111",
+                    "line": {"color": "#111", "width": 1.4},
+                },
+                name="Pareto frontier",
+            )
+        )
+
     fig.update_layout(
         title={
             "text": (
@@ -525,9 +639,12 @@ def write_plot(
         hoverdistance=-1,
         width=1100,
         height=700,
+        legend={"orientation": "h", "y": 1.02, "yanchor": "bottom", "x": 0},
+        margin={"t": 110},
     )
     try:
-        fig.write_html(path, include_plotlyjs="cdn")
+        fig.write_html(path, include_plotlyjs="cdn", div_id=PLOT_DIV_ID)
+        inject_plot_search(path)
     except (OSError, ValueError) as exc:
         fail(f"could not write {path}: {exc}")
 
@@ -537,8 +654,8 @@ def write_plot(
         fg=typer.colors.GREEN,
     )
     typer.echo(
-        "open it in a browser and hover a point for the model, endpoint, "
-        "and full price/throughput breakdown"
+        "open it in a browser: search by model or endpoint slug, hover a point "
+        "for the full price/throughput breakdown"
     )
 
 
@@ -584,6 +701,7 @@ def build_provider_rows(
                 )
                 tag = ep.get("tag")
                 endpoint = endpoint_label(ep.get("provider_name"), tag)
+                slug = provider_slug(ep.get("provider_name"), tag)
                 pcts = throughput_percentiles(ep)
                 quantization = ep.get("quantization")
                 ctx = to_float(ep.get("context_length")) or row["context_length"]
@@ -609,6 +727,7 @@ def build_provider_rows(
                     {
                         "id": row["id"],
                         "provider_name": provider_name,
+                        "provider_slug": slug,
                         "provider_tag": tag,
                         "endpoint": endpoint,
                         "provider_endpoint_name": ep.get("name"),
@@ -757,8 +876,8 @@ def main(
             "--plot",
             metavar="PATH",
             help="write an interactive blended $/Mtok vs throughput scatter to "
-            "PATH (defaults to .html); hover a point for the model and provider. "
-            "Throughput needs an API key",
+            "PATH (defaults to .html); searchable, with the Pareto frontier "
+            "drawn over the points. Throughput needs an API key",
         ),
     ] = None,
 ) -> None:
@@ -875,6 +994,10 @@ def main(
                 kept.append(r)
             provider_rows = kept
 
+    pareto_ids = {id(r) for r in pareto_points(provider_rows)}
+    for r in provider_rows:
+        r["pareto"] = id(r) in pareto_ids
+
     assumptions = {
         "cache_hit_rate": cache_hit_rate,
         "output_ratio": output_ratio,
@@ -944,7 +1067,7 @@ def main(
         tps_col = "TPS_AVG" if tps is TpsMode.AVG else "TPS 50/75/90/95/99"
         tps_width = 8 if tps is TpsMode.AVG else 17
         pheader = (
-            f"{'ENDPOINT':<24} {'MODEL':<46} {'QUANT':<10} {tps_col:>{tps_width}} "
+            f"{'ENDPOINT':<30} {'MODEL':<46} {'QUANT':<10} {tps_col:>{tps_width}} "
             f"{'MODEL_B':>11} {'PROV_B':>11} {'DELTA':>11} {'P_PROMPT':>10} "
             f"{'P_COMPL':>10} {'P_CR':>9} {'CR?':>3} {'ZDR':>3}"
         )
@@ -968,7 +1091,7 @@ def main(
                     else "-"
                 )
             print(
-                f"{(r.get('endpoint') or r['provider_name'])[:24]:<24} {(r['id'] + ' ' + intl)[:46]:<46} "
+                f"{(r.get('endpoint') or r['provider_name'])[:30]:<30} {(r['id'] + ' ' + intl)[:46]:<46} "
                 f"{quant:<10} {tps_val:>{tps_width}} "
                 f"{money(r['model_blended_per_mtok']):>11} "
                 f"{money(r['provider_blended_per_mtok']):>11} "
