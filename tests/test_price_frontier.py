@@ -356,6 +356,17 @@ class TestInjectPlotSearch:
         assert "y: [keep.map(" in script
         assert "text: [keep.map(" in script
 
+    def test_axis_ranges_are_restored_after_filtering(self, tmp_path):
+        # Restyling a subset makes plotly autoscale, which would move every
+        # point still shown, so the on-screen range is replayed afterwards.
+        page = tmp_path / "plot.html"
+        page.write_text('<html><body><div id="pf-plot"></div></body></html>')
+        inject_plot_search(str(page))
+        script = page.read_text()
+        assert '"xaxis.range": here.x' in script
+        assert '"yaxis.range": here.y' in script
+        assert '"xaxis.autorange": false' in script
+
     def test_leaves_page_without_plot_div_untouched(self, tmp_path):
         page = tmp_path / "plot.html"
         original = "<html><body><p>no chart</p></body></html>"

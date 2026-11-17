@@ -507,7 +507,10 @@ PLOT_DIV_ID = "pf-plot"
 
 # Plotly has no built-in search, so the written page gets a small filter box
 # above the chart. Non-matching points are removed from each trace's arrays,
-# which keeps them out of hover as well as out of view.
+# which keeps them out of hover as well as out of view. Axis ranges are pinned
+# to the full-data extent (captured once from the rendered layout, so log-scale
+# units carry over) because otherwise every keystroke re-autoscales the chart
+# and the remaining points jump around.
 PLOT_SEARCH_PANEL = """
 <div id="pf-panel" style="margin:10px 12px 0;background:#fff;border:1px solid #d0d7de;
   border-radius:8px;padding:8px 10px;font:13px/1.4 system-ui,sans-serif;
@@ -540,9 +543,24 @@ PLOT_SEARCH_SCRIPT = """
         ? trace.marker.color.slice() : null
     };
   });
+  // Ranges come from the rendered layout, which already accounts for the log
+  // y axis and plotly's padding, so they can be replayed verbatim.
+  function snapshot() {
+    var xa = gd._fullLayout && gd._fullLayout.xaxis;
+    var ya = gd._fullLayout && gd._fullLayout.yaxis;
+    if (!xa || !ya || !xa.range || !ya.range) return null;
+    return {x: xa.range.slice(), y: ya.range.slice()};
+  }
+
   function apply() {
+    // Hold the range that is on screen right now: restyling fewer points makes
+    // plotly autoscale to the subset, which would move every remaining point.
+    // Reading the live range (rather than a fixed initial one) also means a
+    // zoom the user chose survives a search.
+    var here = snapshot();
     var term = box.value.trim().toLowerCase();
     var total = 0, hits = 0;
+    var pending = [];
     gd.data.forEach(function (trace, i) {
       var texts = base[i].text;
       var keep = [];
@@ -566,12 +584,25 @@ PLOT_SEARCH_SCRIPT = """
       if (base[i].color) {
         upd["marker.color"] = [keep.map(function (j) { return base[i].color[j]; })];
       }
-      Plotly.restyle(gd, upd, [i]);
+      pending.push(Plotly.restyle(gd, upd, [i]));
     });
+    if (here) {
+      Promise.all(pending).then(function () {
+        Plotly.relayout(gd, {
+          "xaxis.range": here.x,
+          "yaxis.range": here.y,
+          "xaxis.autorange": false,
+          "yaxis.autorange": false
+        });
+      });
+    }
     count.textContent = term ? hits + " / " + total + " points" : total + " points";
   }
+
   box.addEventListener("input", apply);
-  apply();
+  count.textContent = base.reduce(function (n, t, i) {
+    return gd.data[i].name === "Pareto frontier" ? n : n + t.text.length;
+  }, 0) + " points";
 })();
 </script>
 """
