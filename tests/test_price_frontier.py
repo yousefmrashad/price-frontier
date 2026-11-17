@@ -16,6 +16,7 @@ from price_frontier import (
     endpoint_label,
     fetch_zdr_keys,
     hover_text,
+    inject_plot_search,
     intelligence_index,
     pareto_points,
     parse_percentile,
@@ -332,6 +333,25 @@ class TestCapBlended:
 
     def test_all_above_cap_returns_empty(self):
         assert cap_blended([self._row(50.0)], 1.0) == []
+
+
+class TestInjectPlotSearch:
+    def test_panel_sits_before_plot_and_script_before_body(self, tmp_path):
+        page = tmp_path / "plot.html"
+        page.write_text('<html><body><div id="pf-plot"></div></body></html>')
+        inject_plot_search(str(page))
+        html = page.read_text()
+        assert html.index('id="pf-panel"') < html.index('id="pf-plot"')
+        assert 'id="pf-search"' in html
+        assert "marker.size" in html
+        assert html.index("Plotly.restyle") < html.index("</body>")
+
+    def test_leaves_page_without_plot_div_untouched(self, tmp_path):
+        page = tmp_path / "plot.html"
+        original = "<html><body><p>no chart</p></body></html>"
+        page.write_text(original)
+        inject_plot_search(str(page))
+        assert page.read_text() == original
 
 
 class TestPlotPath:

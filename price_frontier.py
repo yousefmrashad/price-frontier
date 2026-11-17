@@ -505,24 +505,36 @@ def plot_path(raw: str) -> str:
 
 PLOT_DIV_ID = "pf-plot"
 
-# Plotly has no built-in search, so the written page gets a small filter box.
-# It dims every point whose hover text does not contain the query, which lets
-# you isolate a model or endpoint by slug on a crowded chart.
-PLOT_SEARCH_HTML = """
-<div id="pf-panel" style="position:fixed;top:12px;left:12px;z-index:1000;
-  background:rgba(255,255,255,.95);border:1px solid #d0d7de;border-radius:8px;
-  padding:8px 10px;font:13px/1.4 system-ui,sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.08)">
+# Plotly has no built-in search, so the written page gets a small filter box
+# above the chart. Points are hidden by zeroing their marker size: plotly's
+# restyle collapses a per-point marker.opacity array to a single scalar, which
+# made every point inherit the first point's opacity.
+PLOT_SEARCH_PANEL = """
+<div id="pf-panel" style="margin:10px 12px 0;background:#fff;border:1px solid #d0d7de;
+  border-radius:8px;padding:8px 10px;font:13px/1.4 system-ui,sans-serif;
+  box-shadow:0 1px 4px rgba(0,0,0,.06);display:inline-block">
   <label for="pf-search" style="font-weight:600;margin-right:6px">Search</label>
   <input id="pf-search" type="search" placeholder="model or endpoint slug"
     style="width:230px;padding:4px 6px;border:1px solid #c8d1da;border-radius:5px" />
   <span id="pf-count" style="margin-left:8px;color:#57606a"></span>
 </div>
+"""
+
+PLOT_SEARCH_SCRIPT = """
 <script>
 (function () {
   var gd = document.getElementById("%s");
   var box = document.getElementById("pf-search");
   var count = document.getElementById("pf-count");
   if (!gd || !box || !count) return;
+  // Cache each trace's full point size so clearing the query restores it.
+  var baseSizes = gd.data.map(function (trace) {
+    var n = (trace.text || []).length;
+    var size = trace.marker && trace.marker.size;
+    if (Array.isArray(size)) return size.slice();
+    var one = typeof size === "number" ? size : 12;
+    return Array.from({length: n}, function () { return one; });
+  });
   function apply() {
     var term = box.value.trim().toLowerCase();
     var total = 0, hits = 0;
@@ -531,11 +543,16 @@ PLOT_SEARCH_HTML = """
       var match = texts.map(function (t) {
         return !term || String(t).toLowerCase().indexOf(term) !== -1;
       });
-      var base = trace.name === "Pareto frontier" ? 1 : 0.85;
-      match.forEach(function (m) { if (m) hits++; });
-      total += match.length;
+      // The frontier duplicates rows from the main trace, so only count the
+      // main trace in the badge.
+      if (trace.name !== "Pareto frontier") {
+        match.forEach(function (m) { if (m) hits++; });
+        total += match.length;
+      }
+      var sizes = baseSizes[i].map(function (s, j) { return match[j] ? s : 0; });
       Plotly.restyle(gd, {
-        "marker.opacity": match.map(function (m) { return m ? base : 0.05; })
+        "marker.size": [sizes],
+        "opacity": [match.some(Boolean) ? 1 : 0]
       }, [i]);
     });
     count.textContent = term ? hits + " / " + total + " points" : total + " points";
@@ -548,12 +565,14 @@ PLOT_SEARCH_HTML = """
 
 
 def inject_plot_search(path: str) -> None:
-    """Add the search box to a written plot page, before </body>."""
+    """Add the search panel above the chart and its script before </body>."""
     html = Path(path).read_text(encoding="utf-8")
-    if "</body>" not in html:
+    div = f'<div id="{PLOT_DIV_ID}"'
+    if "</body>" not in html or div not in html:
         return
-    panel = PLOT_SEARCH_HTML % PLOT_DIV_ID
-    Path(path).write_text(html.replace("</body>", panel + "</body>"), encoding="utf-8")
+    html = html.replace(div, PLOT_SEARCH_PANEL + div, 1)
+    html = html.replace("</body>", (PLOT_SEARCH_SCRIPT % PLOT_DIV_ID) + "</body>", 1)
+    Path(path).write_text(html, encoding="utf-8")
 
 
 def write_plot(
