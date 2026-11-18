@@ -48,6 +48,7 @@ class SortKey(str, Enum):
 
 
 class TpsMode(str, Enum):
+    P50 = "p50"
     AVG = "avg"
     PERCENTILES = "percentiles"
 
@@ -315,6 +316,20 @@ def blended_per_mtok(
 PERCENTILE_KEYS = (50, 75, 90, 95, 99)
 
 
+def primary_throughput(pcts: dict[int, float]) -> float | None:
+    """The single throughput number used for charts and ranking.
+
+    p50 is the typical request rather than a mean dragged around by a long
+    tail, which is what makes one endpoint look faster than another. Endpoint
+    payloads always carry p50 alongside the other percentiles; if a response
+    ever omits it, fall back to the mean of what was reported instead of
+    dropping the row.
+    """
+    if 50 in pcts:
+        return pcts[50]
+    return sum(pcts.values()) / len(pcts) if pcts else None
+
+
 def cap_blended(
     rows: list[dict[str, Any]], max_blended: float | None
 ) -> list[dict[str, Any]]:
@@ -432,13 +447,13 @@ def pareto_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for other in points:
             if other is candidate:
                 continue
-            faster = other["throughput_avg"] >= candidate["throughput_avg"]
+            faster = other["throughput_p50"] >= candidate["throughput_p50"]
             cheaper = (
                 other["provider_blended_per_mtok"]
                 <= candidate["provider_blended_per_mtok"]
             )
             strictly_better = (
-                other["throughput_avg"] > candidate["throughput_avg"]
+                other["throughput_p50"] > candidate["throughput_p50"]
                 or other["provider_blended_per_mtok"]
                 < candidate["provider_blended_per_mtok"]
             )
@@ -459,7 +474,7 @@ def plot_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         r
         for r in rows
-        if r["throughput_avg"] is not None
+        if r["throughput_p50"] is not None
         and r["intelligence_index"] is not None
         and r["provider_blended_per_mtok"] is not None
     ]
@@ -482,7 +497,7 @@ def hover_text(row: dict[str, Any]) -> str:
         f"model blended: {money(row['model_blended_per_mtok'])}/Mtok",
         f"delta: {money(row['delta_vs_model'])}",
         f"retention: {retention_label(row.get('zdr'))}",
-        f"throughput avg: {row['throughput_avg']:.0f} tok/s",
+        f"throughput p50: {row['throughput_p50']:.0f} tok/s",
     ]
     if pcts:
         lines.append(
@@ -638,11 +653,11 @@ def write_plot(
     # Imported lazily so the table and JSON paths do not pay for it.
     import plotly.graph_objects as go
 
-    frontier = sorted(pareto_points(points), key=lambda r: r["throughput_avg"])
+    frontier = sorted(pareto_points(points), key=lambda r: r["throughput_p50"])
 
     fig = go.Figure(
         go.Scatter(
-            x=[r["throughput_avg"] for r in points],
+            x=[r["throughput_p50"] for r in points],
             y=[r["provider_blended_per_mtok"] for r in points],
             text=[hover_text(r) for r in points],
             hovertemplate="%{text}<extra></extra>",
@@ -667,7 +682,7 @@ def write_plot(
     if frontier:
         fig.add_trace(
             go.Scatter(
-                x=[r["throughput_avg"] for r in frontier],
+                x=[r["throughput_p50"] for r in frontier],
                 y=[r["provider_blended_per_mtok"] for r in frontier],
                 text=[hover_text(r) for r in frontier],
                 hovertemplate="%{text}<extra></extra>",
@@ -692,7 +707,7 @@ def write_plot(
                 f"cache_write_share={cache_write_share:.0%}</sup>"
             )
         },
-        xaxis_title="Throughput (tokens/sec, avg of reported percentiles)",
+        xaxis_title="Throughput (tokens/sec, p50)",
         yaxis_title="Blended $/Mtok (provider, log scale)",
         yaxis_type="log",
         template="plotly_white",
@@ -811,6 +826,7 @@ def build_provider_rows(
                         "uptime": uptime,
                         "latency": to_float(ep.get("latency_last_30m")),
                         "throughput_percentiles": pcts,
+                        "throughput_p50": primary_throughput(pcts),
                         "throughput_avg": (sum(pcts.values()) / len(pcts))
                         if pcts
                         else None,
@@ -902,7 +918,13 @@ def main(
             help="parallel endpoints requests (default 6)",
         ),
     ] = 6,
-    tps: Annotated[TpsMode, typer.Option("--tps")] = TpsMode.AVG,
+    tps: Annotated[
+        TpsMode,
+        typer.Option(
+            "--tps",
+            help="throughput column: p50 (default), avg, or percentiles",
+        ),
+    ] = TpsMode.P50,
     provider_sort: Annotated[ProviderSort, typer.Option("--provider-sort")] = (
         ProviderSort.PROVIDER
     ),
@@ -1127,8 +1149,12 @@ def main(
             f"\njoined on endpoint - {len(provider_rows)} rows across "
             f"{len({r['id'] for r in provider_rows})} models"
         )
-        tps_col = "TPS_AVG" if tps is TpsMode.AVG else "TPS 50/75/90/95/99"
-        tps_width = 8 if tps is TpsMode.AVG else 17
+        if tps is TpsMode.P50:
+            tps_col, tps_width = "TPS_P50", 8
+        elif tps is TpsMode.AVG:
+            tps_col, tps_width = "TPS_AVG", 8
+        else:
+            tps_col, tps_width = "TPS 50/75/90/95/99", 17
         pheader = (
             f"{'ENDPOINT':<30} {'MODEL':<46} {'QUANT':<10} {tps_col:>{tps_width}} "
             f"{'MODEL_B':>11} {'PROV_B':>11} {'DELTA':>11} {'P_PROMPT':>10} "
@@ -1143,7 +1169,10 @@ def main(
                 if r["intelligence_index"] is None
                 else format(r["intelligence_index"], ".1f")
             )
-            if tps is TpsMode.AVG:
+            if tps is TpsMode.P50:
+                p50 = r["throughput_p50"]
+                tps_val = "-" if p50 is None else f"{p50:.0f}"
+            elif tps is TpsMode.AVG:
                 avg = r["throughput_avg"]
                 tps_val = "-" if avg is None else f"{avg:.0f}"
             else:

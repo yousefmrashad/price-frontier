@@ -22,6 +22,7 @@ from price_frontier import (
     parse_percentile,
     plot_path,
     plot_points,
+    primary_throughput,
     provider_slug,
     retention_label,
     retention_mark,
@@ -197,7 +198,7 @@ class TestThroughputPercentiles:
 class TestPlotPoints:
     def row(self, **overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
-            "throughput_avg": 100.0,
+            "throughput_p50": 100.0,
             "intelligence_index": 40.0,
             "provider_blended_per_mtok": 5.0,
         }
@@ -207,13 +208,13 @@ class TestPlotPoints:
         assert len(plot_points([self.row()])) == 1
 
     def test_drops_rows_without_throughput(self):
-        assert plot_points([self.row(throughput_avg=None)]) == []
+        assert plot_points([self.row(throughput_p50=None)]) == []
 
     def test_drops_rows_without_intelligence(self):
         assert plot_points([self.row(intelligence_index=None)]) == []
 
     def test_keeps_zero_price_and_zero_tps(self):
-        point = self.row(provider_blended_per_mtok=0.0, throughput_avg=0.0)
+        point = self.row(provider_blended_per_mtok=0.0, throughput_p50=0.0)
         assert plot_points([point]) == [point]
 
 
@@ -252,7 +253,7 @@ class TestHoverText:
             "provider_blended_per_mtok": 1.5,
             "model_blended_per_mtok": 3.0,
             "delta_vs_model": -1.5,
-            "throughput_avg": 230.4,
+            "throughput_p50": 230.4,
             "throughput_percentiles": {50: 210.0, 95: 280.0},
             "uptime": 0.997,
             "latency": 0.42,
@@ -283,10 +284,25 @@ class TestHoverText:
         assert "p50/75" not in text
 
 
+class TestPrimaryThroughput:
+    def test_prefers_p50_over_the_mean(self):
+        pcts = {50: 10.0, 75: 50.0, 90: 100.0, 99: 400.0}
+        assert primary_throughput(pcts) == 10.0
+
+    def test_falls_back_to_mean_without_p50(self):
+        assert primary_throughput({75: 20.0, 90: 40.0}) == pytest.approx(30.0)
+
+    def test_empty_is_none(self):
+        assert primary_throughput({}) is None
+
+    def test_zero_is_preserved(self):
+        assert primary_throughput({50: 0.0, 75: 5.0}) == 0.0
+
+
 class TestParetoPoints:
     def _row(self, tps: float, price: float) -> dict[str, Any]:
         return {
-            "throughput_avg": tps,
+            "throughput_p50": tps,
             "provider_blended_per_mtok": price,
             "intelligence_index": 40.0,
         }
@@ -308,7 +324,7 @@ class TestParetoPoints:
 
     def test_rows_without_throughput_are_ignored(self):
         complete = self._row(10, 1.0)
-        incomplete = {**self._row(50, 0.5), "throughput_avg": None}
+        incomplete = {**self._row(50, 0.5), "throughput_p50": None}
         assert pareto_points([complete, incomplete]) == [complete]
 
     def test_empty_input(self):
@@ -523,7 +539,7 @@ class TestRetentionLabels:
             "provider_blended_per_mtok": 1.0,
             "model_blended_per_mtok": 2.0,
             "delta_vs_model": -1.0,
-            "throughput_avg": 10.0,
+            "throughput_p50": 10.0,
             "throughput_percentiles": {},
         }
         assert "zero-retention" in hover_text({**base, "zdr": True})
@@ -620,6 +636,19 @@ class TestBuildProviderRowsZdr:
         )
         assert rows[0]["uptime"] == pytest.approx(1.0)
 
+    def test_throughput_p50_comes_from_the_p50_percentile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        endpoint = self._endpoint(
+            throughput_last_30m={"p50": 12.0, "p75": 40.0, "p99": 90.0}
+        )
+        rows = build_provider_rows(
+            [self._model()], self._cfg(monkeypatch, endpoint, set())
+        )
+        assert rows[0]["throughput_p50"] == pytest.approx(12.0)
+        # The mean is still carried for --tps avg.
+        assert rows[0]["throughput_avg"] == pytest.approx((12 + 40 + 90) / 3)
+
     def test_uptime_fraction_scale_left_alone(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -639,7 +668,7 @@ class TestBuildProviderRowsZdr:
             "provider_blended_per_mtok": 1.0,
             "model_blended_per_mtok": 2.0,
             "delta_vs_model": -1.0,
-            "throughput_avg": 10.0,
+            "throughput_p50": 10.0,
             "throughput_percentiles": {},
         }
         assert "endpoint: OpenAI/flex" in hover_text({**base, "zdr": None})
@@ -653,7 +682,7 @@ class TestBuildProviderRowsZdr:
             "provider_blended_per_mtok": 1.0,
             "model_blended_per_mtok": 2.0,
             "delta_vs_model": -1.0,
-            "throughput_avg": 10.0,
+            "throughput_p50": 10.0,
             "throughput_percentiles": {},
             "uptime": 1.0,
             "latency": None,
@@ -669,7 +698,7 @@ class TestBuildProviderRowsZdr:
             "provider_blended_per_mtok": 1.0,
             "model_blended_per_mtok": 2.0,
             "delta_vs_model": -1.0,
-            "throughput_avg": 10.0,
+            "throughput_p50": 10.0,
             "throughput_percentiles": {},
         }
         assert "endpoint: P" in hover_text({**base, "zdr": None})

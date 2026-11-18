@@ -116,7 +116,7 @@ fraction of the throughput, and Azure mirrors OpenAI at the same price.
 | `DELTA` | `PROV_B - MODEL_B`; negative means the endpoint is cheaper |
 | `CR?` | `~` marks an endpoint with no `input_cache_read` price |
 | `ZDR` | Zero data retention: `yes`, `no`, or `?` when unreachable |
-| `TPS_AVG` | Mean of the reported throughput percentiles |
+| `TPS_P50` | Median throughput; the metric used to rank and plot endpoints |
 | `INTL` | Artificial Analysis intelligence index |
 
 Filter endpoints by data retention with `--retention zdr` (zero-retention only)
@@ -143,7 +143,7 @@ hovering a point names the endpoint.
 | `--provider-sort` | `provider` | `provider`, `delta`, `model`, `name` (endpoint label) |
 | `--retention` | `all` | `all`, `zdr`, or `non-zdr` endpoint data-retention filter |
 | `--provider-workers` | `6` | Parallel endpoint requests |
-| `--tps` | `avg` | `avg` or `percentiles` for the throughput column |
+| `--tps` | `p50` | `p50`, `avg`, or `percentiles` for the throughput column |
 | `--plot PATH` | none | Write an interactive HTML scatter |
 | `--json` | off | Emit JSON instead of a table |
 | `--api-key` | `$OPENROUTER_API_KEY` | OpenRouter key; needed for throughput |
