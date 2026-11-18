@@ -710,6 +710,10 @@ def write_plot(
         xaxis_title="Throughput (tokens/sec, p50)",
         yaxis_title="Blended $/Mtok (provider, log scale)",
         yaxis_type="log",
+        # On a log axis plotly abbreviates a narrow range to a mantissa ladder
+        # ("9", "8", ... "2"), which reads like plain integers. Ask for the
+        # significant digits instead; ~ drops the trailing zeros it pads with.
+        yaxis_tickformat="$,.3~g",
         template="plotly_white",
         hovermode="closest",
         # Hover anywhere in the column, not just on the marker itself, so the
