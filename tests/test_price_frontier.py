@@ -300,11 +300,13 @@ class TestPrimaryThroughput:
 
 
 class TestParetoPoints:
-    def _row(self, tps: float, price: float) -> dict[str, Any]:
+    def _row(
+        self, tps: float, price: float, intelligence: float = 40.0
+    ) -> dict[str, Any]:
         return {
             "throughput_p50": tps,
             "provider_blended_per_mtok": price,
-            "intelligence_index": 40.0,
+            "intelligence_index": intelligence,
         }
 
     def test_drops_dominated_points(self):
@@ -321,6 +323,24 @@ class TestParetoPoints:
     def test_ties_are_all_kept(self):
         a, b = self._row(10, 1.0), self._row(10, 1.0)
         assert pareto_points([a, b]) == [a, b]
+
+    def test_fast_cheap_low_intelligence_does_not_dominate_smart(self):
+        slow_smart = self._row(10, 5.0, 60.0)
+        fast_cheap_dumb = self._row(100, 1.0, 20.0)
+        assert pareto_points([slow_smart, fast_cheap_dumb]) == [
+            slow_smart,
+            fast_cheap_dumb,
+        ]
+
+    def test_faster_cheaper_smarter_dominates(self):
+        worse = self._row(10, 5.0, 20.0)
+        better = self._row(100, 1.0, 60.0)
+        assert pareto_points([worse, better]) == [better]
+
+    def test_smarter_dominates_at_equal_speed_and_price(self):
+        dumb = self._row(50, 1.0, 20.0)
+        smart = self._row(50, 1.0, 60.0)
+        assert pareto_points([dumb, smart]) == [smart]
 
     def test_rows_without_throughput_are_ignored(self):
         complete = self._row(10, 1.0)

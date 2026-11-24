@@ -434,11 +434,14 @@ def retention_mark(zdr: bool | None) -> str:
 
 
 def pareto_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Non-dominated rows: no other point is both faster and cheaper.
+    """Non-dominated rows: no other point is faster, cheaper, and smarter.
 
-    Ties are kept (neither strictly better), so a duplicated endpoint is not
-    silently collapsed. Rows without throughput or price are excluded upstream
-    by plot_points().
+    Dominance is three-objective — throughput_p50, provider blended $/Mtok,
+    and intelligence index — so a fast-and-cheap but low-intelligence endpoint
+    does not knock a slower, pricier, smarter one off the frontier. Ties are
+    kept (neither strictly better), so a duplicated endpoint is not silently
+    collapsed. Rows without throughput, price, or intelligence are excluded
+    upstream by plot_points().
     """
     points = plot_points(rows)
     frontier: list[dict[str, Any]] = []
@@ -452,12 +455,14 @@ def pareto_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 other["provider_blended_per_mtok"]
                 <= candidate["provider_blended_per_mtok"]
             )
+            smarter = other["intelligence_index"] >= candidate["intelligence_index"]
             strictly_better = (
                 other["throughput_p50"] > candidate["throughput_p50"]
                 or other["provider_blended_per_mtok"]
                 < candidate["provider_blended_per_mtok"]
+                or other["intelligence_index"] > candidate["intelligence_index"]
             )
-            if faster and cheaper and strictly_better:
+            if faster and cheaper and smarter and strictly_better:
                 dominated = True
                 break
         if not dominated:

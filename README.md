@@ -73,9 +73,9 @@ price-frontier --limit 6 --provider-sort delta
 ```
 
 Write an interactive plot and open it in a browser. Points are searchable by
-model or endpoint slug, and the Pareto frontier (nothing faster and cheaper) is
-drawn over them. Hovering a point names the model and endpoint, with the full
-price and throughput breakdown:
+model or endpoint slug, and the Pareto frontier (nothing faster, cheaper, and
+smarter) is drawn over them. Hovering a point names the model and endpoint,
+with the full price and throughput breakdown:
 
 ```bash
 price-frontier --limit 30 --plot frontier.html --provider-sort delta
